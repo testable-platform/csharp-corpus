@@ -47,7 +47,14 @@ each branch is the machine-readable answer key for that cell.
 ## History
 
 Branches were moved into this repository by relocating their existing git
-history under a new name -- every commit, author, date and
-`Co-authored-by:` trailer is unchanged from before consolidation. Nothing
-was squashed or rewritten, so tools that read commit history (churn,
-ownership, `pydriller`, etc.) see the same signal they always did.
+history under a new name; commit dates, parentage and every tree are unchanged
+from before consolidation.
+
+In October 2026 the commit *messages* and author identities were rewritten
+once: placeholder contributor names were replaced, and several author spellings
+of the same person were folded into one. No commit was squashed, added or
+dropped, and no file content changed.
+
+Tools that read commit history -- churn, ownership, `pydriller` -- see four
+contributors on every branch, which is what each branch's `dataset.json`
+asserts under `expectations.controlAssertions`.
