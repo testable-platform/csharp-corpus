@@ -1,0 +1,1336 @@
+﻿// Copyright (c) Toni Solarin-Sodara
+// Licensed under the MIT license. See LICENSE file in the project root for full license information.
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using Coverlet.Core.Abstractions;
+using Coverlet.Core.Helpers;
+using Coverlet.Core.Instrumentation;
+using Coverlet.Core.Samples.Tests;
+using Coverlet.Core.Symbols;
+using Coverlet.Tests.Utils;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.Emit;
+using Microsoft.Extensions.DependencyModel;
+using Microsoft.VisualStudio.TestPlatform;
+using Mono.Cecil;
+using Mono.Cecil.Cil;
+using Moq;
+using Xunit;
+
+namespace Coverlet.Core.Tests.Instrumentation
+{
+  public class InstrumenterTests : IDisposable
+  {
+    private readonly Mock<ILogger> _mockLogger = new();
+    private Action _disposeAction;
+    private bool _disposed;
+
+    protected virtual void Dispose(bool disposing)
+    {
+      if (!_disposed)
+      {
+        if (disposing)
+        {
+          _disposeAction?.Invoke();
+        }
+        _disposed = true;
+      }
+    }
+
+    public void Dispose()
+    {
+      Dispose(true);
+      GC.SuppressFinalize(this);
+    }
+
+    ~InstrumenterTests()
+    {
+      Dispose(false);
+    }
+
+    [Fact]
+    public void TestCoreLibInstrumentation()
+    {
+      DirectoryInfo directory = Directory.CreateDirectory(Path.Combine(Directory.GetCurrentDirectory(), nameof(TestCoreLibInstrumentation)));
+      string[] files = new[]
+      {
+                "System.Private.CoreLib.dll",
+                "System.Private.CoreLib.pdb"
+            };
+
+      foreach (string file in files)
+      {
+        File.Copy(Path.Combine(Directory.GetCurrentDirectory(), "TestAssets", file), Path.Combine(directory.FullName, file), overwrite: true);
+      }
+
+      var partialMockFileSystem = new Mock<FileSystem>();
+      partialMockFileSystem.CallBase = true;
+      partialMockFileSystem.Setup(fs => fs.OpenRead(It.IsAny<string>())).Returns((string path) =>
+      {
+        if (Path.GetFileName(path.Replace(@"\", @"/")) == files[1])
+        {
+          return File.OpenRead(Path.Combine(Path.Combine(Directory.GetCurrentDirectory(), "TestAssets"), files[1]));
+        }
+        else
+        {
+          return File.OpenRead(path);
+        }
+      });
+      partialMockFileSystem.Setup(fs => fs.Exists(It.IsAny<string>())).Returns((string path) =>
+      {
+        if (Path.GetFileName(path.Replace(@"\", @"/")) == files[1])
+        {
+          return File.Exists(Path.Combine(Path.Combine(Directory.GetCurrentDirectory(), "TestAssets"), files[1]));
+        }
+        else
+        {
+          if (path.Contains(@":\git\runtime"))
+          {
+            return true;
+          }
+          else
+          {
+            return File.Exists(path);
+          }
+        }
+      });
+      var sourceRootTranslator = new SourceRootTranslator(_mockLogger.Object, new FileSystem());
+      var parameters = new CoverageParameters();
+      var instrumentationHelper =
+          new InstrumentationHelper(new ProcessExitHandler(), new RetryHelper(), partialMockFileSystem.Object, _mockLogger.Object, sourceRootTranslator);
+      var instrumenter = new Instrumenter(Path.Combine(directory.FullName, files[0]), "_coverlet_instrumented", parameters, _mockLogger.Object, instrumentationHelper, partialMockFileSystem.Object, sourceRootTranslator, new CecilSymbolHelper());
+
+      Assert.True(instrumenter.CanInstrument());
+      InstrumenterResult result = instrumenter.Instrument();
+      Assert.NotNull(result);
+      Assert.Equal(1052, result.Documents.Count);
+      foreach ((string docName, Coverlet.Core.Instrumentation.Document _) in result.Documents)
+      {
+        Assert.False(docName.EndsWith(@"System.Private.CoreLib\src\System\Threading\Interlocked.cs"));
+      }
+      directory.Delete(true);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void TestInstrument(bool singleHit)
+    {
+      InstrumenterTest instrumenterTest = CreateInstrumentor(singleHit: singleHit);
+
+      InstrumenterResult result = instrumenterTest.Instrumenter.Instrument();
+
+      Assert.Equal(Path.GetFileNameWithoutExtension(instrumenterTest.Module), result.Module);
+      Assert.Equal(instrumenterTest.Module, result.ModulePath);
+
+      instrumenterTest.Directory.Delete(true);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void TestInstrumentCoreLib(bool singleHit)
+    {
+      InstrumenterTest instrumenterTest = CreateInstrumentor(fakeCoreLibModule: true, singleHit: singleHit);
+
+      InstrumenterResult result = instrumenterTest.Instrumenter.Instrument();
+
+      Assert.Equal(Path.GetFileNameWithoutExtension(instrumenterTest.Module), result.Module);
+      Assert.Equal(instrumenterTest.Module, result.ModulePath);
+
+      instrumenterTest.Directory.Delete(true);
+    }
+
+    [Theory]
+    [InlineData(typeof(ClassExcludedByCodeAnalysisCodeCoverageAttr))]
+    [InlineData(typeof(ClassExcludedByCoverletCodeCoverageAttr))]
+    public void TestInstrument_ClassesWithExcludeAttributeAreExcluded(Type excludedType)
+    {
+      InstrumenterTest instrumenterTest = CreateInstrumentor();
+      InstrumenterResult result = instrumenterTest.Instrumenter.Instrument();
+
+      Coverlet.Core.Instrumentation.Document doc = result.Documents.Values.FirstOrDefault(d => Path.GetFileName(d.Path) == "Samples.cs");
+      Assert.NotNull(doc);
+
+      bool found = doc.Lines.Values.Any(l => l.Class == excludedType.FullName);
+      Assert.False(found, "Class decorated with with exclude attribute should be excluded");
+
+      instrumenterTest.Directory.Delete(true);
+    }
+
+    [Theory]
+    [InlineData(typeof(ClassExcludedByAttrWithoutAttributeNameSuffix), nameof(TestSDKAutoGeneratedCode))]
+    [InlineData(typeof(ClassExcludedByAttrWithoutAttributeNameSuffix), "Microsoft.VisualStudio.TestPlatform.TestSDKAutoGeneratedCode")]
+    public void TestInstrument_ClassesWithExcludeAttributeWithoutAttributeNameSuffixAreExcluded(Type excludedType, string excludedAttribute)
+    {
+      InstrumenterTest instrumenterTest = CreateInstrumentor(attributesToIgnore: new string[] { excludedAttribute });
+      InstrumenterResult result = instrumenterTest.Instrumenter.Instrument();
+
+      Coverlet.Core.Instrumentation.Document doc = result.Documents.Values.FirstOrDefault(d => Path.GetFileName(d.Path) == "Samples.cs");
+      Assert.NotNull(doc);
+
+      bool found = doc.Lines.Values.Any(l => l.Class == excludedType.FullName);
+      Assert.False(found, "Class decorated with with exclude attribute should be excluded");
+
+      instrumenterTest.Directory.Delete(true);
+    }
+
+    [Theory]
+    [InlineData(nameof(ObsoleteAttribute))]
+    [InlineData("Obsolete")]
+    [InlineData("System.ObsoleteAttribute")]
+    public void TestInstrument_ClassesWithCustomExcludeAttributeAreExcluded(string excludedAttribute)
+    {
+      InstrumenterTest instrumenterTest = CreateInstrumentor(attributesToIgnore: new string[] { excludedAttribute });
+      InstrumenterResult result = instrumenterTest.Instrumenter.Instrument();
+
+      Coverlet.Core.Instrumentation.Document doc = result.Documents.Values.FirstOrDefault(d => Path.GetFileName(d.Path) == "Samples.cs");
+      Assert.NotNull(doc);
+#pragma warning disable CS0612 // Type or member is obsolete
+      bool found = doc.Lines.Values.Any(l => l.Class.Equals(typeof(ClassExcludedByObsoleteAttr).FullName));
+#pragma warning restore CS0612 // Type or member is obsolete
+      Assert.False(found, "Class decorated with with exclude attribute should be excluded");
+
+      instrumenterTest.Directory.Delete(true);
+    }
+
+    [Theory]
+    [InlineData(nameof(ObsoleteAttribute), "ClassWithMethodExcludedByObsoleteAttr")]
+    [InlineData("Obsolete", "ClassWithMethodExcludedByObsoleteAttr")]
+    [InlineData("System.ObsoleteAttribute", "ClassWithMethodExcludedByObsoleteAttr")]
+    [InlineData(nameof(TestSDKAutoGeneratedCode), "ClassExcludedByAttrWithoutAttributeNameSuffix")] //extend this with full name
+    public void TestInstrument_ClassesWithMethodWithCustomExcludeAttributeAreExcluded(string excludedAttribute, string testClassName)
+    {
+      InstrumenterTest instrumenterTest = CreateInstrumentor(attributesToIgnore: new string[] { excludedAttribute });
+      InstrumenterResult result = instrumenterTest.Instrumenter.Instrument();
+
+      Coverlet.Core.Instrumentation.Document doc = result.Documents.Values.FirstOrDefault(d => Path.GetFileName(d.Path) == "Samples.cs");
+      Assert.NotNull(doc);
+      bool found = doc.Lines.Values.Any(l => l.Method.Equals($"System.String Coverlet.Core.Samples.Tests.{testClassName}::Method(System.String)"));
+      Assert.False(found, "Method decorated with with exclude attribute should be excluded");
+
+      instrumenterTest.Directory.Delete(true);
+    }
+
+    [Theory]
+    [InlineData(nameof(ObsoleteAttribute), "ClassWithPropertyExcludedByObsoleteAttr")]
+    [InlineData("Obsolete", "ClassWithPropertyExcludedByObsoleteAttr")]
+    [InlineData("System.ObsoleteAttribute", "ClassWithPropertyExcludedByObsoleteAttr")]
+    public void TestInstrument_ClassesWithPropertyWithCustomExcludeAttributeAreExcluded(string excludedAttribute, string testClassName)
+    {
+      InstrumenterTest instrumenterTest = CreateInstrumentor(attributesToIgnore: new string[] { excludedAttribute });
+      InstrumenterResult result = instrumenterTest.Instrumenter.Instrument();
+
+      Coverlet.Core.Instrumentation.Document doc = result.Documents.Values.FirstOrDefault(d => Path.GetFileName(d.Path) == "Samples.cs");
+      Assert.NotNull(doc);
+      bool getFound = doc.Lines.Values.Any(l => l.Method.Equals($"System.String Coverlet.Core.Samples.Tests.{testClassName}::get_Property()"));
+      Assert.False(getFound, "Property getter decorated with with exclude attribute should be excluded");
+
+      bool setFound = doc.Lines.Values.Any(l => l.Method.Equals($"System.String Coverlet.Core.Samples.Tests.{testClassName}::set_Property()"));
+      Assert.False(setFound, "Property setter decorated with with exclude attribute should be excluded");
+
+      instrumenterTest.Directory.Delete(true);
+    }
+
+    [Fact]
+    public void TestPreflight_LockedModule_ReturnsLocked()
+    {
+      InstrumenterTest instrumenterTest = CreateInstrumentor();
+      try
+      {
+        var fileSystemMock = new Mock<FileSystem>();
+        fileSystemMock.CallBase = true;
+        fileSystemMock
+          .Setup(fs => fs.NewFileStream(instrumenterTest.Module, FileMode.Open, FileAccess.ReadWrite))
+          .Throws(new IOException("The process cannot access the file because it is being used by another process."));
+
+        var instrumentationHelper =
+          new InstrumentationHelper(new ProcessExitHandler(), new RetryHelper(), fileSystemMock.Object, new Mock<ILogger>().Object,
+                                    new SourceRootTranslator(new Mock<ILogger>().Object, fileSystemMock.Object));
+
+        var instrumenter = new Instrumenter(instrumenterTest.Module,
+                                            instrumenterTest.Identifier,
+                                            new CoverageParameters(),
+                                            _mockLogger.Object,
+                                            instrumentationHelper,
+                                            fileSystemMock.Object,
+                                            new SourceRootTranslator(_mockLogger.Object, fileSystemMock.Object),
+                                            new CecilSymbolHelper());
+
+        InstrumentationPreflightResult preflightResult = instrumenter.Preflight();
+
+        Assert.Equal(InstrumentationPreflightStatus.Locked, preflightResult.Status);
+      }
+      finally
+      {
+        instrumenterTest.Directory.Delete(true);
+      }
+    }
+
+    [Fact]
+    public void TestPreflight_UnresolvableDependency_ReturnsUnresolvableDependencies()
+    {
+      string tempDirectory = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+      Directory.CreateDirectory(tempDirectory);
+      string modulePath = Path.Combine(tempDirectory, "preflight-unresolvable.dll");
+
+      try
+      {
+        var assemblyName = new AssemblyNameDefinition("preflight-unresolvable", new Version(1, 0, 0, 0));
+        using (AssemblyDefinition assemblyDefinition = AssemblyDefinition.CreateAssembly(assemblyName, "preflight-unresolvable", ModuleKind.Dll))
+        {
+          assemblyDefinition.MainModule.AssemblyReferences.Add(new AssemblyNameReference("Definitely.Missing.Dependency", new Version(1, 0, 0, 0)));
+          assemblyDefinition.Write(modulePath);
+        }
+
+        var instrumentationHelper =
+            new InstrumentationHelper(new ProcessExitHandler(), new RetryHelper(), new FileSystem(), new Mock<ILogger>().Object,
+                                      new SourceRootTranslator(new Mock<ILogger>().Object, new FileSystem()));
+
+        var instrumenter = new Instrumenter(modulePath,
+                                            Guid.NewGuid().ToString("N"),
+                                            new CoverageParameters(),
+                                            _mockLogger.Object,
+                                            instrumentationHelper,
+                                            new FileSystem(),
+                                            new SourceRootTranslator(_mockLogger.Object, new FileSystem()),
+                                            new CecilSymbolHelper());
+
+        InstrumentationPreflightResult preflightResult = instrumenter.Preflight();
+
+        Assert.Equal(InstrumentationPreflightStatus.UnresolvableDependencies, preflightResult.Status);
+        Assert.Contains("Definitely.Missing.Dependency", preflightResult.Reason, StringComparison.Ordinal);
+      }
+      finally
+      {
+        Directory.Delete(tempDirectory, true);
+      }
+    }
+
+    private InstrumenterTest CreateInstrumentor(bool fakeCoreLibModule = false, string[] attributesToIgnore = null, string[] excludedFiles = null, bool singleHit = false)
+    {
+      string module = GetType().Assembly.Location;
+      string pdb = Path.Combine(Path.GetDirectoryName(module), Path.GetFileNameWithoutExtension(module) + ".pdb");
+      string identifier = Guid.NewGuid().ToString();
+
+      DirectoryInfo directory = Directory.CreateDirectory(Path.Combine(Path.GetTempPath(), identifier));
+
+      string destModule, destPdb;
+      if (fakeCoreLibModule)
+      {
+        destModule = "System.Private.CoreLib.dll";
+        destPdb = "System.Private.CoreLib.pdb";
+      }
+      else
+      {
+        destModule = Path.GetFileName(module);
+        destPdb = Path.GetFileName(pdb);
+      }
+
+      File.Copy(module, Path.Combine(directory.FullName, destModule), true);
+      File.Copy(pdb, Path.Combine(directory.FullName, destPdb), true);
+
+      var instrumentationHelper =
+          new InstrumentationHelper(new ProcessExitHandler(), new RetryHelper(), new FileSystem(), new Mock<ILogger>().Object, new SourceRootTranslator(new Mock<ILogger>().Object, new FileSystem()));
+
+      module = Path.Combine(directory.FullName, destModule);
+      CoverageParameters parameters = new()
+      {
+        ExcludeAttributes = attributesToIgnore,
+        DoesNotReturnAttributes = new string[] { "DoesNotReturnAttribute" }
+      };
+      var instrumenter = new Instrumenter(module, identifier, parameters, _mockLogger.Object, instrumentationHelper, new FileSystem(), new SourceRootTranslator(_mockLogger.Object, new FileSystem()), new CecilSymbolHelper());
+      return new InstrumenterTest
+      {
+        Instrumenter = instrumenter,
+        Module = module,
+        Identifier = identifier,
+        Directory = directory
+      };
+    }
+
+    class InstrumenterTest
+    {
+      public Instrumenter Instrumenter { get; set; }
+
+      public string Module { get; set; }
+
+      public string Identifier { get; set; }
+
+      public DirectoryInfo Directory { get; set; }
+    }
+
+    [Fact]
+    public void TestInstrument_NetStandardAwareAssemblyResolver_FromRuntime()
+    {
+      var netstandardResolver = new NetstandardAwareAssemblyResolver(null, _mockLogger.Object);
+
+      // We ask for "official" netstandard.dll implementation with know MS public key cc7b13ffcd2ddd51 same in all runtime
+      AssemblyDefinition resolved = netstandardResolver.Resolve(AssemblyNameReference.Parse("netstandard, Version=0.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51"));
+      Assert.NotNull(resolved);
+
+      // We check that netstandard.dll was resolved from runtime folder, where System.Object is
+      Assert.Equal(Path.Combine(Path.GetDirectoryName(typeof(object).Assembly.Location), "netstandard.dll"), resolved.MainModule.FileName);
+    }
+
+    [Fact]
+    public void TestInstrument_NetStandardAwareAssemblyResolver_FromFolder()
+    {
+      // Someone could create a custom dll named netstandard.dll we need to be sure that not
+      // conflicts with "official" resolution
+
+      // We create dummy netstandard.dll
+      var compilation = CSharpCompilation.Create(
+          "netstandard",
+          new[] { CSharpSyntaxTree.ParseText("", cancellationToken: TestContext.Current.CancellationToken) },
+          new[] { MetadataReference.CreateFromFile(typeof(object).Assembly.Location) },
+          new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+
+      Assembly newAssembly;
+      using (var dllStream = new MemoryStream())
+      {
+        EmitResult emitResult = compilation.Emit(dllStream, cancellationToken: TestContext.Current.CancellationToken);
+        Assert.True(emitResult.Success);
+        newAssembly = Assembly.Load(dllStream.ToArray());
+        // remove if exists
+        File.Delete("netstandard.dll");
+        File.WriteAllBytes("netstandard.dll", dllStream.ToArray());
+      }
+
+      var netstandardResolver = new NetstandardAwareAssemblyResolver(newAssembly.Location, _mockLogger.Object);
+      AssemblyDefinition resolved = netstandardResolver.Resolve(AssemblyNameReference.Parse(newAssembly.FullName));
+
+      // We check if final netstandard.dll resolved is local folder one and not "official" netstandard.dll
+      Assert.Equal(Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location), "netstandard.dll"), Path.GetFullPath(resolved.MainModule.FileName));
+    }
+
+    public static IEnumerable<object[]> TestInstrument_ExcludedFilesHelper_Data()
+    {
+      yield return new object[] { new string[]{ @"one.txt" }, new ValueTuple<string, bool, bool>[]
+                                        {
+                                            (@"one.txt", true, false),
+                                            (@"c:\dir\one.txt", false, true),
+                                            (@"dir/one.txt", false, false)
+                                        }};
+      yield return new object[] { new string[]{ @"*one.txt" }, new ValueTuple<string, bool, bool>[]
+                                        {
+                                            (@"one.txt", true , false),
+                                            (@"c:\dir\one.txt", false, true),
+                                            (@"dir/one.txt", false, false)
+                                        }};
+      yield return new object[] { new string[]{ @"*.txt" }, new ValueTuple<string, bool, bool>[]
+                                        {
+                                            (@"one.txt", true, false),
+                                            (@"c:\dir\one.txt", false, true),
+                                            (@"dir/one.txt", false, false)
+                                        }};
+      yield return new object[] { new string[]{ @"*.*" }, new ValueTuple<string, bool, bool>[]
+                                        {
+                                            (@"one.txt", true, false),
+                                            (@"c:\dir\one.txt", false, true),
+                                            (@"dir/one.txt", false, false)
+                                        }};
+      yield return new object[] { new string[]{ @"one.*" }, new ValueTuple<string, bool, bool>[]
+                                        {
+                                            (@"one.txt", true, false),
+                                            (@"c:\dir\one.txt", false, true),
+                                            (@"dir/one.txt", false, false)
+                                        }};
+      yield return new object[] { new string[]{ @"dir/*.txt" }, new ValueTuple<string, bool, bool>[]
+                                        {
+                                            (@"one.txt", false, false),
+                                            (@"c:\dir\one.txt", true, true),
+                                            (@"dir/one.txt", true, false)
+                                        }};
+      yield return new object[] { new string[]{ @"dir\*.txt" }, new ValueTuple<string, bool, bool>[]
+                                        {
+                                            (@"one.txt", false, false),
+                                            (@"c:\dir\one.txt", true, true),
+                                            (@"dir/one.txt", true, false)
+                                        }};
+      yield return new object[] { new string[]{ @"**/*" }, new ValueTuple<string, bool, bool>[]
+                                        {
+                                            (@"one.txt", true, false),
+                                            (@"c:\dir\one.txt", true, true),
+                                            (@"dir/one.txt", true, false)
+                                        }};
+      yield return new object[] { new string[]{ @"dir/**/*" }, new ValueTuple<string, bool, bool>[]
+                                        {
+                                            (@"one.txt", false, false),
+                                            (@"c:\dir\one.txt", true, true),
+                                            (@"dir/one.txt", true, false),
+                                            (@"c:\dir\dir2\one.txt", true, true),
+                                            (@"dir/dir2/one.txt", true, false)
+                                        }};
+      yield return new object[] { new string[]{ @"one.txt", @"dir\*two.txt" }, new ValueTuple<string, bool, bool>[]
+                                        {
+                                            (@"one.txt", true, false),
+                                            (@"c:\dir\imtwo.txt", true, true),
+                                            (@"dir/one.txt", false, false)
+                                        }};
+
+      // This is a special case test different drive same path
+      // We strip out drive from path to check for globbing
+      // BTW I don't know if makes sense add a filter with full path maybe we should forbid
+      yield return new object[] { new string[]{ @"c:\dir\one.txt" }, new ValueTuple<string, bool, bool>[]
+                                        {
+                                            (@"c:\dir\one.txt", true, true),
+                                            (@"d:\dir\one.txt", true, true) // maybe should be false?
+                                        }};
+
+      yield return new object[] { new string[]{ null }, new ValueTuple<string, bool, bool>[]
+                                        {
+                                            (null, false, false),
+                                        }};
+    }
+
+    [Theory(DisableDiscoveryEnumeration = true)]
+    [MemberData(nameof(TestInstrument_ExcludedFilesHelper_Data))]
+    public void TestInstrument_ExcludedFilesHelper(string[] excludeFilterHelper, ValueTuple<string, bool, bool>[] result)
+    {
+      var _excludeFilterHelper = new ExcludedFilesHelper(excludeFilterHelper, new Mock<ILogger>().Object);
+      foreach (ValueTuple<string, bool, bool> checkFile in result)
+      {
+        if (checkFile.Item3) // run test only on windows platform
+        {
+          if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+          {
+            Assert.Equal(checkFile.Item2, _excludeFilterHelper.Exclude(checkFile.Item1));
+          }
+        }
+        else
+        {
+          Assert.Equal(checkFile.Item2, _excludeFilterHelper.Exclude(checkFile.Item1));
+        }
+      }
+    }
+
+    [Fact]
+    public void SkipEmbeddedPdbWithoutLocalSource()
+    {
+      string xunitDll = Directory.GetFiles(Directory.GetCurrentDirectory(), "xunit.v3.core.dll")[0];
+      var loggerMock = new Mock<ILogger>();
+
+      var instrumentationHelper =
+          new InstrumentationHelper(new ProcessExitHandler(), new RetryHelper(), new FileSystem(), loggerMock.Object,
+                                    new SourceRootTranslator(xunitDll, new Mock<ILogger>().Object, new FileSystem(), new AssemblyAdapter()));
+
+      var instrumenter = new Instrumenter(xunitDll, "_xunit_instrumented", new CoverageParameters(), loggerMock.Object,
+          instrumentationHelper, new FileSystem(),
+          new SourceRootTranslator(xunitDll, loggerMock.Object, new FileSystem(), new AssemblyAdapter()),
+          new CecilSymbolHelper());
+
+      // xUnit v3 NuGet package may or may not have embedded PDB depending on how it was built/packaged.
+      // In deterministic CI builds, the PDB characteristics may differ from local development builds.
+      bool hasPdb = instrumentationHelper.HasPdb(xunitDll, out bool embedded);
+
+      if (hasPdb && embedded)
+      {
+        // xUnit has embedded PDB and no local sources, so it should not be instrumentable
+        Assert.False(instrumenter.CanInstrument());
+        loggerMock.Verify(l => l.LogVerbose(It.IsAny<string>()));
+      }
+      else
+      {
+        // Skip embedded PDB assertions - xUnit v3 package does not have embedded PDB in this build configuration.
+        // This can happen in CI builds with deterministic build settings or different NuGet package versions.
+        _mockLogger.Object.LogInformation(
+            $"Skipping embedded PDB test for xUnit: HasPdb={hasPdb}, Embedded={embedded}. " +
+            "xUnit v3 NuGet package may not include embedded PDB in all build configurations.");
+      }
+
+      // Default case - Use sample's location, not the test assembly's
+      string sample = Directory.GetFiles(Directory.GetCurrentDirectory(), "coverlet.tests.projectsample.empty.dll")[0];
+      var loggerMock2 = new Mock<ILogger>();  // Fresh mock to enable VerifyNoOtherCalls
+
+      instrumentationHelper =
+          new InstrumentationHelper(new ProcessExitHandler(), new RetryHelper(), new FileSystem(), loggerMock2.Object,
+                                    new SourceRootTranslator(sample, loggerMock2.Object, new FileSystem(), new AssemblyAdapter()));
+
+      // Use ExcludeAssembliesWithoutSources = "None" to bypass source file checks in CI
+      // where deterministic builds may produce PDB paths that don't exist locally
+      instrumenter = new Instrumenter(sample, "_coverlet_tests_projectsample_empty",
+          new CoverageParameters { ExcludeAssembliesWithoutSources = "None" }, loggerMock2.Object, instrumentationHelper, new FileSystem(),
+          new SourceRootTranslator(sample, loggerMock2.Object, new FileSystem(), new AssemblyAdapter()),
+          new CecilSymbolHelper());
+
+      bool sampleHasPdb = instrumentationHelper.HasPdb(sample, out embedded);
+      Assert.True(sampleHasPdb, "Sample assembly should have a PDB file");
+      Assert.False(embedded, "Sample assembly should not have an embedded PDB");
+      Assert.True(instrumenter.CanInstrument(), "Sample assembly with external PDB and ExcludeAssembliesWithoutSources=None should be instrumentable");
+    }
+
+    [Fact]
+    public void SkipPdbWithoutLocalSource()
+    {
+      string dllFileName = "75d9f96508d74def860a568f426ea4a4.dll";
+      string pdbFileName = "75d9f96508d74def860a568f426ea4a4.pdb";
+
+      var partialMockFileSystem = new Mock<FileSystem>();
+      partialMockFileSystem.CallBase = true;
+      partialMockFileSystem.Setup(fs => fs.OpenRead(It.IsAny<string>())).Returns((string path) =>
+      {
+        if (Path.GetFileName(path.Replace(@"\", @"/")) == pdbFileName)
+        {
+          return File.OpenRead(Path.Combine(Path.Combine(Directory.GetCurrentDirectory(), "TestAssets"), pdbFileName));
+        }
+        else
+        {
+          return File.OpenRead(path);
+        }
+      });
+      partialMockFileSystem.Setup(fs => fs.Exists(It.IsAny<string>())).Returns((string path) =>
+      {
+        if (Path.GetFileName(path.Replace(@"\", @"/")) == pdbFileName)
+        {
+          return File.Exists(Path.Combine(Path.Combine(Directory.GetCurrentDirectory(), "TestAssets"), pdbFileName));
+        }
+        else
+        {
+          return File.Exists(path);
+        }
+      });
+
+      var instrumentationHelper =
+          new InstrumentationHelper(new ProcessExitHandler(), new RetryHelper(), partialMockFileSystem.Object, _mockLogger.Object, new SourceRootTranslator(_mockLogger.Object, new FileSystem()));
+      string sample = Directory.GetFiles(Path.Combine(Directory.GetCurrentDirectory(), "TestAssets"), dllFileName)[0];
+      var loggerMock = new Mock<ILogger>();
+      var instrumenter = new Instrumenter(sample, "_75d9f96508d74def860a568f426ea4a4_instrumented", new CoverageParameters(), loggerMock.Object, instrumentationHelper, partialMockFileSystem.Object, new SourceRootTranslator(loggerMock.Object, new FileSystem()), new CecilSymbolHelper());
+
+      Assert.True(instrumentationHelper.HasPdb(sample, out bool embedded));
+      Assert.False(embedded);
+      Assert.False(instrumenter.CanInstrument());
+      _mockLogger.Verify(l => l.LogVerbose(It.IsAny<string>()));
+    }
+
+    [Fact]
+    public void TestInstrument_MissingModule()
+    {
+      var loggerMock = new Mock<ILogger>();
+
+      var instrumentationHelper =
+              new InstrumentationHelper(new ProcessExitHandler(), new RetryHelper(), new FileSystem(), new Mock<ILogger>().Object,
+                                        new SourceRootTranslator(new Mock<ILogger>().Object, new FileSystem()));
+
+      var instrumenter = new Instrumenter("test", "_test_instrumented", new CoverageParameters(), loggerMock.Object, instrumentationHelper, new FileSystem(), new SourceRootTranslator(loggerMock.Object, new FileSystem()), new CecilSymbolHelper());
+
+      Assert.False(instrumenter.CanInstrument());
+      loggerMock.Verify(l => l.LogWarning(It.IsAny<string>()));
+    }
+
+    [Fact]
+    public void CanInstrumentFSharpAssemblyWithAnonymousRecord()
+    {
+      var loggerMock = new Mock<ILogger>();
+
+      string sample = Directory.GetFiles(Directory.GetCurrentDirectory(), "coverlet.tests.projectsample.fsharp.dll")[0];
+      
+      // Use sample's location, not the test assembly's location
+      var instrumentationHelper =
+          new InstrumentationHelper(new ProcessExitHandler(), new RetryHelper(), new FileSystem(), new Mock<ILogger>().Object,
+              new SourceRootTranslator(sample, new Mock<ILogger>().Object, new FileSystem(), new AssemblyAdapter()));
+
+      var instrumenter = new Instrumenter(sample, "_coverlet_tests_projectsample_fsharp", 
+          new CoverageParameters { ExcludeAssembliesWithoutSources = "None" }, // Add this to avoid source check failures
+          loggerMock.Object, instrumentationHelper,
+          new FileSystem(), new SourceRootTranslator(sample, loggerMock.Object, new FileSystem(), new AssemblyAdapter()), 
+          new CecilSymbolHelper());
+
+      Assert.True(instrumentationHelper.HasPdb(sample, out bool embedded));
+      Assert.False(embedded);
+      Assert.True(instrumenter.CanInstrument());
+    }
+
+    [Fact]
+    public void CanInstrument_AssemblySearchTypeNone_ReturnsTrue()
+    {
+      var loggerMock = new Mock<ILogger>();
+      var instrumentationHelper = new Mock<IInstrumentationHelper>();
+      bool embeddedPdb;
+      instrumentationHelper.Setup(x => x.HasPdb(It.IsAny<string>(), out embeddedPdb)).Returns(true);
+
+      var instrumenter = new Instrumenter(It.IsAny<string>(), It.IsAny<string>(), new CoverageParameters { ExcludeAssembliesWithoutSources = "None" },
+          loggerMock.Object, instrumentationHelper.Object, new Mock<IFileSystem>().Object, new Mock<ISourceRootTranslator>().Object, new CecilSymbolHelper());
+
+      Assert.True(instrumenter.CanInstrument());
+    }
+
+    [Theory]
+    [InlineData("NotAMatch", new string[] { }, false)]
+    [InlineData("ExcludeFromCoverageAttribute", new string[] { }, true)]
+    [InlineData("ExcludeFromCodeCoverageAttribute", new string[] { }, true)]
+    [InlineData("CustomExclude", new string[] { "CustomExclude" }, true)]
+    [InlineData("CustomExcludeAttribute", new string[] { "CustomExclude" }, true)]
+    [InlineData("CustomExcludeAttribute", new string[] { "CustomExcludeAttribute" }, true)]
+    public void TestInstrument_AssemblyMarkedAsExcludeFromCodeCoverage(string attributeName, string[] excludedAttributes, bool expectedExcludes)
+    {
+      string EmitAssemblyToInstrument(string outputFolder)
+      {
+        SyntaxTree attributeClassSyntaxTree = CSharpSyntaxTree.ParseText("[System.AttributeUsage(System.AttributeTargets.Assembly)]public class " + attributeName + ":System.Attribute{}");
+        SyntaxTree instrumentedClassSyntaxTree = CSharpSyntaxTree.ParseText($@"
+[assembly:{attributeName}]
+namespace coverlet.tests.projectsample.excludedbyattribute{{
+public class SampleClass
+{{
+    public int SampleMethod()
+    {{
+        return new System.Random().Next();
+    }}
+}}
+
+}}
+");
+        CSharpCompilation compilation = CSharpCompilation.Create(attributeName, new List<SyntaxTree>
+                {
+                    attributeClassSyntaxTree,instrumentedClassSyntaxTree
+                }).AddReferences(
+            MetadataReference.CreateFromFile(typeof(Attribute).Assembly.Location)).
+        WithOptions(new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, false));
+
+        string dllPath = Path.Combine(outputFolder, $"{attributeName}.dll");
+        string pdbPath = Path.Combine(outputFolder, $"{attributeName}.pdb");
+
+        using (FileStream outputStream = File.Create(dllPath))
+        using (FileStream pdbStream = File.Create(pdbPath))
+        {
+          bool isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+          var emitOptions = new EmitOptions(pdbFilePath: pdbPath);
+          EmitResult emitResult = compilation.Emit(outputStream, pdbStream, options: isWindows ? emitOptions : emitOptions.WithDebugInformationFormat(DebugInformationFormat.PortablePdb));
+          if (!emitResult.Success)
+          {
+            string message = "Failure to dynamically create dll";
+            foreach (Diagnostic diagnostic in emitResult.Diagnostics)
+            {
+              message += Environment.NewLine;
+              message += diagnostic.GetMessage();
+            }
+            throw new Xunit.Sdk.XunitException(message);
+          }
+        }
+        return dllPath;
+      }
+
+      string tempDirectory = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+      Directory.CreateDirectory(tempDirectory);
+      _disposeAction = () => Directory.Delete(tempDirectory, true);
+
+      var partialMockFileSystem = new Mock<FileSystem>();
+      partialMockFileSystem.CallBase = true;
+      partialMockFileSystem.Setup(fs => fs.NewFileStream(It.IsAny<string>(), It.IsAny<FileMode>(), It.IsAny<FileAccess>())).Returns((string path, FileMode mode, FileAccess access) =>
+      {
+        return new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+      });
+      var loggerMock = new Mock<ILogger>();
+
+      string excludedbyattributeDll = EmitAssemblyToInstrument(tempDirectory);
+
+      var instrumentationHelper =
+              new InstrumentationHelper(new ProcessExitHandler(), new RetryHelper(), new FileSystem(), new Mock<ILogger>().Object,
+                                        new SourceRootTranslator(new Mock<ILogger>().Object, new FileSystem()));
+      CoverageParameters parameters = new();
+      parameters.ExcludeAttributes = excludedAttributes;
+      var instrumenter = new Instrumenter(excludedbyattributeDll, "_xunit_excludedbyattribute", parameters, loggerMock.Object, instrumentationHelper, partialMockFileSystem.Object, new SourceRootTranslator(loggerMock.Object, new FileSystem()), new CecilSymbolHelper());
+
+      InstrumenterResult result = instrumenter.Instrument();
+      Assert.Empty(result.Documents);
+      if (expectedExcludes) { loggerMock.Verify(l => l.LogVerbose(It.IsAny<string>())); }
+    }
+
+    [Fact]
+    public void TestInstrument_NetstandardAwareAssemblyResolver_PreserveCompilationContext()
+    {
+      var netstandardResolver = new NetstandardAwareAssemblyResolver(Assembly.GetExecutingAssembly().Location, _mockLogger.Object);
+      // The deprecated version is not available and replaced by actual published .NET runtime versions. Minimal supported version is 6.0.0.
+      AssemblyDefinition asm = netstandardResolver.TryWithCustomResolverOnDotNetCore(new AssemblyNameReference("Microsoft.Extensions.Logging.Abstractions", new Version("2.2.0")));
+      Assert.NotNull(asm);
+    }
+
+    [Fact]
+    public void TestInstrument_NetstandardAwareAssemblyResolver_SiblingRuntimeConfigCanResolveSharedFrameworkAssembly()
+    {
+      string tempDirectory = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+      Directory.CreateDirectory(tempDirectory);
+      try
+      {
+        string modulePath = Path.Combine(tempDirectory, "copied.project.reference.dll");
+
+        string runtimeVersion = new DirectoryInfo(Path.GetDirectoryName(typeof(object).Assembly.Location)!).Name;
+        var runtimeAssemblyVersion = typeof(object).Assembly.GetName().Version;
+        string runtimeConfigFile = Path.Combine(tempDirectory, "testhost.runtimeconfig.json");
+        File.WriteAllText(runtimeConfigFile,
+            "{\n" +
+            "  \"runtimeOptions\": {\n" +
+            $"    \"tfm\": \"net{runtimeAssemblyVersion.Major}.{runtimeAssemblyVersion.Minor}\",\n" +
+            "    \"framework\": {\n" +
+            "      \"name\": \"Microsoft.NETCore.App\",\n" +
+            $"      \"version\": \"{runtimeVersion}\"\n" +
+            "    }\n" +
+            "  }\n" +
+            "}\n");
+
+        NetCoreSharedFrameworkResolver sharedFrameworkResolver = new NetCoreSharedFrameworkResolver(modulePath, _mockLogger.Object);
+        AssemblyName textJsonAssembly = typeof(System.Text.Json.JsonSerializer).Assembly.GetName();
+        var compilationLibrary = new CompilationLibrary(
+            "package",
+            textJsonAssembly.Name,
+            textJsonAssembly.Version.ToString(),
+            "sha512-not-relevant",
+            Enumerable.Empty<string>(),
+            Enumerable.Empty<Dependency>(),
+            true);
+        var assemblies = new List<string>();
+        bool resolved = sharedFrameworkResolver.TryResolveAssemblyPaths(compilationLibrary, assemblies);
+
+        Assert.True(resolved);
+        Assert.NotEmpty(assemblies);
+        using AssemblyDefinition asm = AssemblyDefinition.ReadAssembly(assemblies[0]);
+        Assert.Equal(textJsonAssembly.Name, asm.Name.Name);
+      }
+      finally
+      {
+        Directory.Delete(tempDirectory, true);
+      }
+    }
+
+    [Fact]
+    public void TestInstrument_NetstandardAwareAssemblyResolver_MissingFromCompileLibrariesFallsBackToSharedFramework()
+    {
+      // Regression test for https://github.com/coverlet-coverage/coverlet/issues/2026: an assembly
+      // can be completely absent from every *.deps.json's compileLibraries (e.g. when the
+      // FrameworkReference that pulls it in is declared transitively - on a referenced
+      // project/package - rather than directly on the instrumented module; recent SDKs, observed
+      // starting with the 10.0.4xx feature band, stop listing such assemblies there) yet still be
+      // physically present in a shared framework directory (e.g. Microsoft.AspNetCore.App).
+      // Before the fix, TryWithCustomResolverOnDotNetCore gave up the moment the compileLibraries
+      // lookup missed, without ever asking NetCoreSharedFrameworkResolver directly - even though
+      // that resolver (already part of _compositeResolver, see constructor) could find it on disk.
+      string tempDirectory = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+      Directory.CreateDirectory(tempDirectory);
+      try
+      {
+        // No *.deps.json is written here on purpose: TryWithCustomResolverOnDotNetCore's
+        // Directory.GetFiles(..., "*.deps.json") scan then finds nothing, so its "libraries"
+        // dictionary stays empty and the initial lookup misses - exactly the state a caller sees
+        // when their assembly isn't listed in any compileLibraries at all.
+        string modulePath = Path.Combine(tempDirectory, "module.without.deps.json.dll");
+
+        string runtimeVersion = new DirectoryInfo(Path.GetDirectoryName(typeof(object).Assembly.Location)!).Name;
+        string runtimeConfigFile = Path.Combine(tempDirectory, "testhost.runtimeconfig.json");
+        File.WriteAllText(runtimeConfigFile,
+            "{\n" +
+            "  \"runtimeOptions\": {\n" +
+            "    \"tfm\": \"net8.0\",\n" +
+            "    \"framework\": {\n" +
+            "      \"name\": \"Microsoft.NETCore.App\",\n" +
+            $"      \"version\": \"{runtimeVersion}\"\n" +
+            "    }\n" +
+            "  }\n" +
+            "}\n");
+
+        var netstandardResolver = new NetstandardAwareAssemblyResolver(modulePath, _mockLogger.Object);
+        AssemblyName textJsonAssembly = typeof(System.Text.Json.JsonSerializer).Assembly.GetName();
+
+        AssemblyDefinition asm = netstandardResolver.TryWithCustomResolverOnDotNetCore(
+            new AssemblyNameReference(textJsonAssembly.Name, textJsonAssembly.Version));
+
+        Assert.NotNull(asm);
+        Assert.Equal(textJsonAssembly.Name, asm.Name.Name);
+      }
+      finally
+      {
+        Directory.Delete(tempDirectory, true);
+      }
+    }
+
+    [Fact]
+    public void TestReachabilityHelper()
+    {
+      int[] allInstrumentedLines =
+          new[]
+          {
+                    // Throws
+                    7, 8,
+                    // NoBranches
+                    12, 13, 14, 15, 16,
+                    // If
+                    19, 20, 22, 23, 24, 25, 26, 27, 29, 30,
+                    // Switch
+                    33, 34, 36, 39, 40, 41, 42, 44, 45, 49, 50, 52, 53, 55, 56, 58, 59, 61, 62, 64, 65, 68, 69,
+                    // Subtle
+                    72, 73, 75, 78, 79, 80, 82, 83, 86, 87, 88, 91, 92, 95, 96, 98, 99, 101, 102, 103,
+                    // UnreachableBranch
+                    106, 107, 108, 110, 111, 112, 113, 114,
+                    // ThrowsGeneric
+                    118, 119,
+                    // CallsGenericMethodDoesNotReturn
+                    124, 125, 126, 127, 128,
+                    // AlsoThrows
+                    134, 135,
+                    // CallsGenericClassDoesNotReturn
+                    140, 141, 142, 143, 144,
+                    // WithLeave
+                    147, 149, 150, 151, 152, 153, 154, 155, 156, 159, 161, 163, 166, 167, 168,
+                    // FiltersAndFinally
+                    171, 173, 174, 175, 176, 177, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 192, 193, 194, 195, 196, 197
+          };
+      int[] notReachableLines =
+          new[]
+          {
+                    // NoBranches
+                    15, 16,
+                    // If
+                    26, 27,
+                    // Switch
+                    41, 42,
+                    // Subtle
+                    79, 80, 88, 96, 98, 99,
+                    // UnreachableBranch
+                    110, 111, 112, 113, 114,
+                    // CallsGenericMethodDoesNotReturn
+                    127, 128,
+                    // CallsGenericClassDoesNotReturn
+                    143, 144,
+                    // WithLeave
+                    163, 164,
+                    // FiltersAndFinally
+                    176, 177, 183, 184, 189, 190, 195, 196, 197
+          };
+
+      int[] expectedToBeInstrumented = allInstrumentedLines.Except(notReachableLines).ToArray();
+
+      InstrumenterTest instrumenterTest = CreateInstrumentor();
+      InstrumenterResult result = instrumenterTest.Instrumenter.Instrument();
+
+      Coverlet.Core.Instrumentation.Document doc = result.Documents.Values.FirstOrDefault(d => Path.GetFileName(d.Path) == "Instrumentation.DoesNotReturn.cs");
+
+      // check for instrumented lines
+      doc.AssertNonInstrumentedLines(BuildConfiguration.Debug, notReachableLines);
+      doc.AssertInstrumentLines(BuildConfiguration.Debug, expectedToBeInstrumented);
+
+      instrumenterTest.Directory.Delete(true);
+    }
+
+    [Fact]
+    public void Instrumenter_MethodsWithoutReferenceToSource_AreSkipped()
+    {
+      var loggerMock = new Mock<ILogger>();
+
+      string module = Directory.GetFiles(Directory.GetCurrentDirectory(), "coverlet.tests.projectsample.vbmynamespace.dll")[0];
+      string pdb = Path.Combine(Path.GetDirectoryName(module), Path.GetFileNameWithoutExtension(module) + ".pdb");
+
+      DirectoryInfo directory = Directory.CreateDirectory(Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString()));
+
+      File.Copy(module, Path.Combine(directory.FullName, Path.GetFileName(module)), true);
+      File.Copy(pdb, Path.Combine(directory.FullName, Path.GetFileName(pdb)), true);
+
+      var instrumentationHelper =
+          new InstrumentationHelper(new ProcessExitHandler(), new RetryHelper(), new FileSystem(), new Mock<ILogger>().Object,
+              new SourceRootTranslator(module, new Mock<ILogger>().Object, new FileSystem(), new AssemblyAdapter()));
+
+      CoverageParameters parameters = new();
+
+      var instrumenter = new Instrumenter(Path.Combine(directory.FullName, Path.GetFileName(module)), "_coverlet_tests_projectsample_vbmynamespace", parameters,
+          loggerMock.Object, instrumentationHelper, new FileSystem(), new SourceRootTranslator(Path.Combine(directory.FullName, Path.GetFileName(module)), loggerMock.Object, new FileSystem(), new AssemblyAdapter()), new CecilSymbolHelper());
+
+      instrumentationHelper.BackupOriginalModule(Path.Combine(directory.FullName, Path.GetFileName(module)), "_coverlet_tests_projectsample_vbmynamespace", false);
+
+      InstrumenterResult result = instrumenter.Instrument();
+
+      Assert.False(result.Documents.ContainsKey(string.Empty));
+
+      directory.Delete(true);
+    }
+    [Fact]
+    public void RuntimeConfigurationReaderSingleFrameworkCheck()
+    {
+      var reader = new RuntimeConfigurationReader(@"TestAssets/single.framework.runtimeconfig.json");
+
+      IEnumerable<(string Name, string Version)> referencedFrameworks = reader.GetFrameworks();
+
+      Assert.Single(referencedFrameworks);
+      Assert.Collection(referencedFrameworks, item => Assert.Equal("Microsoft.NETCore.App", item.Name));
+      Assert.Collection(referencedFrameworks, item => Assert.Equal("8.0.0", item.Version));
+
+    }
+
+    [Fact]
+    public void RuntimeConfigurationReaderMultipleFrameworkCheck()
+    {
+      var reader = new RuntimeConfigurationReader(@"TestAssets/multiple.frameworks.runtimeconfig.json");
+
+      (string Name, string Version)[] referencedFrameworks = reader.GetFrameworks().ToArray();
+
+      Assert.Equal(2, referencedFrameworks.Length);
+      Assert.Equal("Microsoft.NETCore.App", referencedFrameworks[0].Name);
+      Assert.Equal("8.0.0", referencedFrameworks[0].Version);
+      Assert.Equal("Microsoft.AspNetCore.App", referencedFrameworks[1].Name);
+      Assert.Equal("8.0.0", referencedFrameworks[1].Version);
+    }
+
+    /// <summary>
+    /// Regression test for https://github.com/coverlet-coverage/coverlet/issues/1818
+    /// When instrumenting a .NET Framework assembly, the injected Tracker class should not
+    /// reference System.Runtime. All type references should point to mscorlib.
+    /// </summary>
+    [Fact]
+    [Trait("Category", "NetFramework")]
+    public void TestInstrument_NetFrameworkAssembly_TrackerUsesCorlibNotSystemRuntime()
+    {
+      // Skip on non-Windows or if .NET Framework sample not built
+      if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+      {
+        return;
+      }
+
+      // Arrange - Find the .NET Framework sample assembly
+      string netFrameworkProjectPath = TestUtils.GetTestBinaryPath("coverlet.tests.projectsample.netframework");
+      string netFrameworkAssemblyPath = Path.Combine(
+          netFrameworkProjectPath,
+          TestUtils.GetBuildConfigurationString(),
+          "coverlet.tests.projectsample.netframework.dll");
+
+      if (!File.Exists(netFrameworkAssemblyPath))
+      {
+        // Skip if the .NET Framework sample hasn't been built
+        return;
+      }
+
+      // Create a temp directory for instrumentation
+      string identifier = Guid.NewGuid().ToString();
+      DirectoryInfo directory = Directory.CreateDirectory(Path.Combine(Path.GetTempPath(), identifier));
+      string destModule = "coverlet.tests.projectsample.netframework.dll";
+      string destPdb = "coverlet.tests.projectsample.netframework.pdb";
+
+      try
+      {
+        // Copy the assembly and PDB to temp directory
+        File.Copy(netFrameworkAssemblyPath, Path.Combine(directory.FullName, destModule), true);
+        string pdbPath = Path.ChangeExtension(netFrameworkAssemblyPath, ".pdb");
+        if (File.Exists(pdbPath))
+        {
+          File.Copy(pdbPath, Path.Combine(directory.FullName, destPdb), true);
+        }
+
+        string modulePath = Path.Combine(directory.FullName, destModule);
+
+        var instrumentationHelper = new InstrumentationHelper(
+            new ProcessExitHandler(),
+            new RetryHelper(),
+            new FileSystem(),
+            _mockLogger.Object,
+            new SourceRootTranslator(_mockLogger.Object, new FileSystem()));
+
+        var parameters = new CoverageParameters();
+        var instrumenter = new Instrumenter(
+            modulePath,
+            identifier,
+            parameters,
+            _mockLogger.Object,
+            instrumentationHelper,
+            new FileSystem(),
+            new SourceRootTranslator(_mockLogger.Object, new FileSystem()),
+            new CecilSymbolHelper());
+
+        // Act - Instrument the assembly
+        if (!instrumenter.CanInstrument())
+        {
+          // Skip if cannot instrument (e.g., no PDB)
+          return;
+        }
+
+        InstrumenterResult result = instrumenter.Instrument();
+        Assert.NotNull(result);
+
+        // Assert - Read the instrumented assembly and verify Tracker type references
+        using var instrumentedModule = ModuleDefinition.ReadModule(modulePath);
+
+        // Find the injected Tracker type
+        TypeDefinition trackerType = instrumentedModule.Types.FirstOrDefault(
+            t => t.Namespace.StartsWith("Coverlet.Core.Instrumentation.Tracker"));
+
+        Assert.NotNull(trackerType);
+
+        // Verify the module's CoreLibrary is mscorlib (confirms it's a .NET Framework assembly)
+        Assert.Equal("mscorlib", instrumentedModule.TypeSystem.CoreLibrary.Name);
+
+        // Verify no type references in the Tracker class point to System.Runtime
+        foreach (FieldDefinition field in trackerType.Fields)
+        {
+          AssertTypeNotSystemRuntime(field.FieldType, "Field: " + field.Name);
+        }
+
+        foreach (MethodDefinition method in trackerType.Methods)
+        {
+          // Check return type
+          AssertTypeNotSystemRuntime(method.ReturnType, $"Method return: {method.Name}");
+
+          // Check parameter types
+          foreach (ParameterDefinition param in method.Parameters)
+          {
+            AssertTypeNotSystemRuntime(param.ParameterType, $"Method param: {method.Name}.{param.Name}");
+          }
+
+          // Check local variable types
+          if (method.HasBody)
+          {
+            foreach (VariableDefinition variable in method.Body.Variables)
+            {
+              AssertTypeNotSystemRuntime(variable.VariableType, $"Method local: {method.Name}");
+            }
+
+            // Check method references in instructions
+            foreach (Instruction instr in method.Body.Instructions)
+            {
+              if (instr.Operand is MethodReference methodRef)
+              {
+                AssertTypeNotSystemRuntime(methodRef.DeclaringType, $"Instruction method ref: {methodRef.FullName}");
+              }
+              else if (instr.Operand is TypeReference typeRef)
+              {
+                AssertTypeNotSystemRuntime(typeRef, $"Instruction type ref: {typeRef.FullName}");
+              }
+            }
+          }
+        }
+      }
+      finally
+      {
+        // Cleanup
+        try
+        {
+          directory.Delete(true);
+        }
+        catch
+        {
+          // Ignore cleanup errors
+        }
+      }
+    }
+
+    /// <summary>
+    /// Regression test for https://github.com/coverlet-coverage/coverlet/issues/1984
+    /// The tracker IL injected into a .NET Framework module must not reference
+    /// System.Runtime.CompilerServices.DefaultInterpolatedStringHandler (a .NET 6+ type). A net8.0+
+    /// build of coverlet.core lowers the template's string interpolations to that handler; injecting
+    /// it makes the tracker's UnloadModule flush handler fail to JIT on .NET Framework, silently
+    /// dropping all coverage while tests still pass. The fix sources the template from an embedded
+    /// netstandard2.0 build, whose interpolations lower to string.Concat/string.Format instead.
+    /// Note: the #1818 test above passes even with the bug present, because the scope-remap points the
+    /// missing handler at mscorlib - so a dedicated assertion on the type identity is required here.
+    /// </summary>
+    [Fact]
+    [Trait("Category", "NetFramework")]
+    public void TestInstrument_NetFrameworkAssembly_TrackerDoesNotReferenceInterpolatedStringHandler()
+    {
+      // Skip on non-Windows or if .NET Framework sample not built
+      if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+      {
+        return;
+      }
+
+      string netFrameworkProjectPath = TestUtils.GetTestBinaryPath("coverlet.tests.projectsample.netframework");
+      string netFrameworkAssemblyPath = Path.Combine(
+          netFrameworkProjectPath,
+          TestUtils.GetBuildConfigurationString(),
+          "coverlet.tests.projectsample.netframework.dll");
+
+      if (!File.Exists(netFrameworkAssemblyPath))
+      {
+        return;
+      }
+
+      string identifier = Guid.NewGuid().ToString();
+      DirectoryInfo directory = Directory.CreateDirectory(Path.Combine(Path.GetTempPath(), identifier));
+      string destModule = "coverlet.tests.projectsample.netframework.dll";
+      string destPdb = "coverlet.tests.projectsample.netframework.pdb";
+
+      try
+      {
+        File.Copy(netFrameworkAssemblyPath, Path.Combine(directory.FullName, destModule), true);
+        string pdbPath = Path.ChangeExtension(netFrameworkAssemblyPath, ".pdb");
+        if (File.Exists(pdbPath))
+        {
+          File.Copy(pdbPath, Path.Combine(directory.FullName, destPdb), true);
+        }
+
+        string modulePath = Path.Combine(directory.FullName, destModule);
+
+        var instrumentationHelper = new InstrumentationHelper(
+            new ProcessExitHandler(),
+            new RetryHelper(),
+            new FileSystem(),
+            _mockLogger.Object,
+            new SourceRootTranslator(_mockLogger.Object, new FileSystem()));
+
+        var instrumenter = new Instrumenter(
+            modulePath,
+            identifier,
+            new CoverageParameters(),
+            _mockLogger.Object,
+            instrumentationHelper,
+            new FileSystem(),
+            new SourceRootTranslator(_mockLogger.Object, new FileSystem()),
+            new CecilSymbolHelper());
+
+        if (!instrumenter.CanInstrument())
+        {
+          return;
+        }
+
+        Assert.NotNull(instrumenter.Instrument());
+
+        using var instrumentedModule = ModuleDefinition.ReadModule(modulePath);
+
+        // Confirms it really is a .NET Framework assembly (core library mscorlib).
+        Assert.Equal("mscorlib", instrumentedModule.TypeSystem.CoreLibrary.Name);
+
+        TypeDefinition trackerType = instrumentedModule.Types.FirstOrDefault(
+            t => t.Namespace.StartsWith("Coverlet.Core.Instrumentation.Tracker"));
+        Assert.NotNull(trackerType);
+
+        foreach (MethodDefinition method in trackerType.Methods)
+        {
+          if (!method.HasBody)
+          {
+            continue;
+          }
+
+          foreach (VariableDefinition variable in method.Body.Variables)
+          {
+            AssertNotInterpolatedStringHandler(variable.VariableType, $"local in {method.Name}");
+          }
+
+          foreach (Instruction instr in method.Body.Instructions)
+          {
+            if (instr.Operand is MethodReference methodRef)
+            {
+              AssertNotInterpolatedStringHandler(methodRef.DeclaringType, $"method ref '{methodRef.FullName}' in {method.Name}");
+            }
+            else if (instr.Operand is TypeReference typeRef)
+            {
+              AssertNotInterpolatedStringHandler(typeRef, $"type ref in {method.Name}");
+            }
+          }
+        }
+      }
+      finally
+      {
+        try
+        {
+          directory.Delete(true);
+        }
+        catch
+        {
+          // Ignore cleanup errors
+        }
+      }
+    }
+
+    /// <summary>
+    /// Regression test for https://github.com/coverlet-coverage/coverlet/issues/1828
+    /// The injected Tracker class must carry [CompilerGenerated] and [ExcludeFromCodeCoverage]
+    /// custom attributes so that reflection-based tooling can identify and skip it.
+    /// </summary>
+    [Fact]
+    public void TestInstrument_TrackerType_HasCompilerGeneratedAndExcludeFromCodeCoverageAttributes()
+    {
+      // Arrange - instrument a real sample assembly so the tracker ends up in a loadable DLL.
+      // We use the empty sample project rather than the test assembly itself so that loading
+      // the instrumented copy via reflection does not conflict with the already-loaded test assembly.
+      string sampleDll = Directory.GetFiles(Directory.GetCurrentDirectory(), "coverlet.tests.projectsample.empty.dll")[0];
+      string samplePdb = Path.ChangeExtension(sampleDll, ".pdb");
+
+      string identifier = Guid.NewGuid().ToString();
+      DirectoryInfo directory = Directory.CreateDirectory(Path.Combine(Path.GetTempPath(), identifier));
+      string modulePath = Path.Combine(directory.FullName, Path.GetFileName(sampleDll));
+
+      File.Copy(sampleDll, modulePath, overwrite: true);
+      if (File.Exists(samplePdb))
+        File.Copy(samplePdb, Path.Combine(directory.FullName, Path.GetFileName(samplePdb)), overwrite: true);
+
+      var instrumentationHelper = new InstrumentationHelper(
+          new ProcessExitHandler(), new RetryHelper(), new FileSystem(), _mockLogger.Object,
+          new SourceRootTranslator(modulePath, _mockLogger.Object, new FileSystem(), new AssemblyAdapter()));
+
+      var instrumenter = new Instrumenter(
+          modulePath, identifier,
+          new CoverageParameters { ExcludeAssembliesWithoutSources = "None" },
+          _mockLogger.Object, instrumentationHelper, new FileSystem(),
+          new SourceRootTranslator(modulePath, _mockLogger.Object, new FileSystem(), new AssemblyAdapter()),
+          new CecilSymbolHelper());
+
+      Assert.True(instrumenter.CanInstrument());
+      instrumenter.Instrument();
+
+      // Act - load the instrumented assembly bytes into memory first so no file handle is held
+      // while reflecting over the tracker type. LoadFromAssemblyPath() keeps a Windows file lock
+      // for the ALC lifetime (GC-driven release), which races against the restore pipeline and
+      // prevents temp directory cleanup. Reading bytes upfront releases the file immediately.
+      byte[] assemblyBytes = File.ReadAllBytes(modulePath);
+
+      var alc = new System.Runtime.Loader.AssemblyLoadContext(
+          nameof(TestInstrument_TrackerType_HasCompilerGeneratedAndExcludeFromCodeCoverageAttributes), isCollectible: true);
+      try
+      {
+        System.Reflection.Assembly instrumentedAssembly = alc.LoadFromStream(new MemoryStream(assemblyBytes));
+        // The tracker type name encodes the module filename and the instrumentation identifier,
+        // so we can match exactly — even if the input assembly was already instrumented by
+        // a prior coverlet run (e.g. CI code-coverage pass) and contains other tracker types.
+        string expectedTrackerName = Path.GetFileNameWithoutExtension(modulePath) + "_" + identifier;
+        Type trackerType = instrumentedAssembly.GetTypes().SingleOrDefault(t =>
+            t.Namespace == "Coverlet.Core.Instrumentation.Tracker" && t.Name == expectedTrackerName);
+
+        // Assert
+        Assert.NotNull(trackerType);
+        Assert.True(
+            trackerType.IsDefined(typeof(System.Runtime.CompilerServices.CompilerGeneratedAttribute), inherit: false),
+            "Tracker type must carry [CompilerGenerated] so reflection-based tooling recognises it as infrastructure (issue #1828).");
+        Assert.True(
+            trackerType.IsDefined(typeof(System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute), inherit: false),
+            "Tracker type must carry [ExcludeFromCodeCoverage] so coverage tools skip it (issue #1828).");
+      }
+      finally
+      {
+        alc.Unload();
+        directory.Delete(recursive: true);
+      }
+    }
+
+    private static void AssertTypeNotSystemRuntime(TypeReference typeRef, string context)
+    {
+      if (typeRef is null)
+        return;
+
+      // Get the element type (handle arrays, generics, etc.)
+      TypeReference elementType = typeRef.GetElementType();
+
+      // Check the scope
+      IMetadataScope scope = elementType.Scope;
+      if (scope is AssemblyNameReference assemblyRef)
+      {
+        // xUnit v3 doesn't support custom messages in Assert.NotEqual
+        // Use Assert.False with condition instead
+        Assert.False(
+            assemblyRef.Name == "System.Runtime",
+            $"Type '{typeRef.FullName}' in {context} should not reference System.Runtime, but found scope: {assemblyRef.Name}");
+      }
+    }
+
+    private static void AssertNotInterpolatedStringHandler(TypeReference typeRef, string context)
+    {
+      if (typeRef is null)
+        return;
+
+      Assert.False(
+          typeRef.GetElementType().FullName == "System.Runtime.CompilerServices.DefaultInterpolatedStringHandler",
+          $"The injected .NET Framework tracker must not reference DefaultInterpolatedStringHandler (found via {context}); " +
+          "the template must be sourced from the embedded netstandard2.0 build. See issue #1984.");
+    }
+  }
+}
