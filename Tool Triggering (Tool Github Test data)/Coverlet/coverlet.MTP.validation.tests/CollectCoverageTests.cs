@@ -1,0 +1,1456 @@
+﻿// Copyright (c) Toni Solarin-Sodara
+// Licensed under the MIT license. See LICENSE file in the project root for full license information.
+
+using System.Diagnostics;
+using System.Text.Json;
+using System.Xml.Linq;
+using Xunit;
+
+namespace Coverlet.MTP.validation.tests;
+
+/// <summary>
+/// Integration tests for Coverlet Microsoft Testing Platform extension.
+/// These tests verify code instrumentation and coverage data collection using MTP.
+/// Similar to coverlet.integration.tests.Collectors but for Microsoft Testing Platform instead of VSTest.
+/// Uses a separate library project (SUT) referenced by the test project - the typical real-world scenario.
+/// </summary>
+[Collection(nameof(MtpValidationTests))]
+public class CollectCoverageTests : MtpValidationTestBase
+{
+  private const string CoverageJsonFileName = "coverage.json";
+  private const string CoverageCoberturaFileName = "coverage.cobertura.xml";
+  private const string CoverageLcovFileName = "coverage.info";
+
+  [Fact]
+  public async Task TestCodeWithoutCodeCoverage()
+  {
+    // Arrange
+    string testName = TestContext.Current.TestCase!.TestMethodName!;
+    using var testProject = CreateTestProject(testName,
+      includeSimpleTest: true,
+      includeMethodTests: true,
+      includeMultipleClasses: true,
+      includeCalculatorTest: true,
+      includeBranchTest: true,
+      includeMultipleTests: true);
+    await BuildProject(testProject.SolutionPath);
+
+    // Act
+    var result = await RunTestsWithCoverage(testProject, "--coverlet-output-format json", testName);
+
+    TestContext.Current?.AddAttachment("Test Output", result.CombinedOutput);
+
+    // Assert
+    Assert.True(result.ExitCode == 0, $"Expected successful test run (exit code 0) but got {result.ExitCode} -> '{result.ErrorText}'.\n\n{result.CombinedOutput}");
+    Assert.Contains("Passed!", result.StandardOutput);
+  }
+
+  [Fact]
+  public async Task BasicCoverage_CollectsDataForCoveredLines()
+  {
+    // Arrange
+    string testName = TestContext.Current.TestCase!.TestMethodName!;
+    using var testProject = CreateTestProject(testName, includeSimpleTest: true);
+    await BuildProject(testProject.SolutionPath);
+
+    // Act
+    var result = await RunTestsWithCoverage(testProject, "--coverlet --coverlet-output-format json", testName);
+
+    TestContext.Current?.AddAttachment("Test Output", result.CombinedOutput);
+
+    // Assert
+    Assert.True(result.ExitCode == 0, $"Expected successful test run (exit code 0) but got {result.ExitCode} -> '{result.ErrorText}'.\n\n{result.CombinedOutput}");
+    Assert.Contains("Passed!", result.StandardOutput);
+
+    CheckCoverageResult(testProject, result, CoverageJsonFileName);
+  }
+
+  [Fact]
+  public async Task CoverageThresholdFailure_UsesMtpManagedExitCode()
+  {
+    // Arrange
+    string testName = TestContext.Current.TestCase!.TestMethodName!;
+    using var testProject = CreateTestProject(testName, includeSimpleTest: true, includeMultipleClasses: true);
+    await BuildProject(testProject.SolutionPath);
+
+    // Act
+    var result = await RunTestsWithCoverage(
+      testProject,
+      "--coverlet --coverlet-output-format json --coverlet-threshold 100 --coverlet-threshold-type line --coverlet-threshold-stat total",
+      testName);
+
+    TestContext.Current?.AddAttachment("Test Output", result.CombinedOutput);
+
+    // Assert
+    Assert.True(result.ExitCode == 14, $"Expected threshold failure exit code 14 from Microsoft Testing Platform but got {result.ExitCode} -> '{result.ErrorText}'.\n\n{result.CombinedOutput}");
+    Assert.Contains("coverage threshold was not met", result.CombinedOutput);
+  }
+
+  [Fact]
+  public async Task CoverageWithFormat_GeneratesCorrectOutputFormat()
+  {
+    // Arrange
+    string testName = TestContext.Current.TestCase!.TestMethodName!;
+    using var testProject = CreateTestProject(testName, includeSimpleTest: true);
+    await BuildProject(testProject.SolutionPath);
+
+    // Act
+    var result = await RunTestsWithCoverage(
+      testProject,
+      "--coverlet --coverlet-output-format cobertura", testName);
+
+    TestContext.Current?.AddAttachment("Test Output", result.CombinedOutput);
+
+    // Assert
+    Assert.True(result.ExitCode == 0, $"Expected successful test run (exit code 0) but got {result.ExitCode} -> '{result.ErrorText}'.\n\n{result.CombinedOutput}");
+
+    CheckCoverageResult(testProject, result, CoverageCoberturaFileName);
+  }
+
+  [Fact]
+  public async Task CoverageInstrumentation_TracksMethodHits()
+  {
+    // Arrange
+    string testName = TestContext.Current.TestCase!.TestMethodName!;
+    using var testProject = CreateTestProject(testName, includeMethodTests: true);
+    await BuildProject(testProject.SolutionPath);
+
+    // Act
+    var result = await RunTestsWithCoverage(testProject, "--coverlet", testName);
+
+    TestContext.Current?.AddAttachment("Test Output", result.CombinedOutput);
+
+    // Assert
+    Assert.True(result.ExitCode == 0, $"Expected successful test run (exit code 0) but got {result.ExitCode} -> '{result.ErrorText}'.\n\n{result.CombinedOutput}");
+
+    CheckCoverageResult(testProject, result, CoverageJsonFileName);
+
+    string[] coverageFiles = Directory.GetFiles(testProject.OutputDirectory, CoverageJsonFileName.Insert(CoverageJsonFileName.LastIndexOf('.'), ".*"), SearchOption.AllDirectories);
+    var coverageData = ParseCoverageJson(coverageFiles[0]);
+
+    // Verify method-level coverage tracking
+    // JSON format: { "Module.dll": { "SourceFile.cs": { "Namespace.Class": { "MethodSignature": { "Lines": {...}, "Branches": [...] } } } } }
+    bool foundCoveredMethod = false;
+
+    foreach (var module in coverageData.RootElement.EnumerateObject()
+      .Where(m => m.Name.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)))
+    {
+      // Enumerate documents (source files)
+      foreach (var document in module.Value.EnumerateObject())
+      {
+        // Enumerate classes
+        foreach (var classEntry in document.Value.EnumerateObject())
+        {
+          // Enumerate methods
+          foreach (var method in classEntry.Value.EnumerateObject())
+          {
+            // Check for Lines property with actual line data
+            if (method.Value.TryGetProperty("Lines", out var lines) &&
+                lines.ValueKind == JsonValueKind.Object &&
+                lines.EnumerateObject().Any())
+            {
+              foundCoveredMethod = true;
+              break;
+            }
+          }
+          if (foundCoveredMethod) break;
+        }
+        if (foundCoveredMethod) break;
+      }
+      if (foundCoveredMethod) break;
+    }
+
+    Assert.True(foundCoveredMethod,
+      $"No covered methods found in coverage data.\n" +
+      $"Coverage file: {coverageFiles[0]}\n\n" +
+      $"Test Output:\n{result.CombinedOutput}");
+  }
+
+  [Fact]
+  public async Task BranchCoverage_TracksConditionalPaths()
+  {
+    // Arrange
+    string testName = TestContext.Current.TestCase!.TestMethodName!;
+    using var testProject = CreateTestProject(testName, includeBranchTest: true);
+    await BuildProject(testProject.SolutionPath);
+
+    // Act
+    var result = await RunTestsWithCoverage(testProject, "--coverlet", testName);
+
+    TestContext.Current?.AddAttachment("Test Output", result.CombinedOutput);
+
+    // Assert
+    Assert.True(result.ExitCode == 0, $"Expected successful test run (exit code 0) but got {result.ExitCode} -> '{result.ErrorText}'.\n\n{result.CombinedOutput}");
+
+    CheckCoverageResult(testProject, result, CoverageJsonFileName);
+
+    string[] coverageFiles = Directory.GetFiles(testProject.OutputDirectory, CoverageJsonFileName.Insert(CoverageJsonFileName.LastIndexOf('.'), ".*"), SearchOption.AllDirectories);
+    var coverageData = ParseCoverageJson(coverageFiles[0]);
+
+    // Verify branch coverage is tracked
+    // JSON format: { "Module.dll": { "SourceFile.cs": { "Namespace.Class": { "MethodSignature": { "Lines": {...}, "Branches": [{...}] } } } } }
+    bool foundBranches = false;
+
+    foreach (var module in coverageData.RootElement.EnumerateObject()
+      .Where(m => m.Name.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)))
+    {
+      // Enumerate documents (source files)
+      foreach (var document in module.Value.EnumerateObject())
+      {
+        // Enumerate classes
+        foreach (var classEntry in document.Value.EnumerateObject())
+        {
+          // Enumerate methods
+          foreach (var method in classEntry.Value.EnumerateObject())
+          {
+            // Check for Branches array with actual branch data
+            if (method.Value.TryGetProperty("Branches", out var branches) &&
+                branches.ValueKind == JsonValueKind.Array &&
+                branches.GetArrayLength() > 0)
+            {
+              foundBranches = true;
+              break;
+            }
+          }
+          if (foundBranches) break;
+        }
+        if (foundBranches) break;
+      }
+      if (foundBranches) break;
+    }
+
+    Assert.True(foundBranches,
+      $"No branch coverage data found.\n" +
+      $"Coverage file: {coverageFiles[0]}\n\n" +
+      $"Test Output:\n{result.CombinedOutput}");
+  }
+
+  [Fact]
+  public async Task MultipleCoverageFormats_GeneratesAllReports()
+  {
+    // Arrange
+    string testName = TestContext.Current.TestCase!.TestMethodName!;
+    using var testProject = CreateTestProject(testName, includeSimpleTest: true);
+    await BuildProject(testProject.SolutionPath);
+
+    // Act
+    var result = await RunTestsWithCoverage(
+      testProject,
+      "--coverlet --coverlet-output-format json --coverlet-output-format cobertura --coverlet-output-format lcov",
+      testName);
+
+    TestContext.Current?.AddAttachment("Test Output", result.CombinedOutput);
+
+    // Assert
+    Assert.True(result.ExitCode == 0, $"Expected successful test run (exit code 0) but got {result.ExitCode} -> '{result.ErrorText}'.\n\n{result.CombinedOutput}");
+
+    // Verify all formats are generated
+    Assert.NotEmpty(Directory.GetFiles(testProject.OutputDirectory, CoverageJsonFileName.Insert(CoverageJsonFileName.LastIndexOf('.'), ".*"), SearchOption.AllDirectories));
+    Assert.NotEmpty(Directory.GetFiles(testProject.OutputDirectory, CoverageCoberturaFileName.Insert(CoverageCoberturaFileName.LastIndexOf('.'), ".*"), SearchOption.AllDirectories));
+    Assert.NotEmpty(Directory.GetFiles(testProject.OutputDirectory, CoverageLcovFileName.Insert(CoverageLcovFileName.LastIndexOf('.'), ".*"), SearchOption.AllDirectories));
+  }
+
+  [Fact]
+  public async Task CoverageWithTeamCityAndCoberturaFormats_TeamCityWritesToConsoleAndCoberturaToFile()
+  {
+    // Arrange
+    string testName = TestContext.Current.TestCase!.TestMethodName!;
+    using var testProject = CreateTestProject(testName, includeSimpleTest: true);
+    await BuildProject(testProject.SolutionPath);
+
+    // Act
+    var result = await RunTestsWithCoverage(
+      testProject,
+      "--coverlet --coverlet-output-format teamcity --coverlet-output-format cobertura",
+      testName);
+
+    TestContext.Current?.AddAttachment("Test Output", result.CombinedOutput);
+
+    // Assert - test run succeeded
+    Assert.True(result.ExitCode == 0, $"Expected successful test run (exit code 0) but got {result.ExitCode} -> '{result.ErrorText}'.\n\n{result.CombinedOutput}");
+
+    // Assert - cobertura file is written to disk
+    string[] coberturaFiles = Directory.GetFiles(
+      testProject.OutputDirectory,
+      CoverageCoberturaFileName.Insert(CoverageCoberturaFileName.LastIndexOf('.'), ".*"),
+      SearchOption.AllDirectories);
+
+    Assert.True(coberturaFiles.Length > 0,
+      $"No {CoverageCoberturaFileName} found in '{testProject.OutputDirectory}'.\n\n{result.CombinedOutput}");
+
+    // Assert - no teamcity file was written to disk (console reporter writes to stdout only)
+    string[] teamCityFiles = Directory.GetFiles(
+      testProject.OutputDirectory,
+      "*.teamcity*",
+      SearchOption.AllDirectories);
+
+    Assert.Empty(teamCityFiles);
+
+    // Assert - teamcity service messages appear in standard output as standalone lines
+    Assert.True(
+      result.StandardOutput.Split('\n').Any(line => line.TrimStart().StartsWith("##teamcity[", StringComparison.Ordinal)),
+      $"Expected at least one output line starting with '##teamcity[' in standard output.\n\n{result.CombinedOutput}");
+  }
+
+  [Fact]
+  public async Task CoverageWithTeamCityFormatOnly_WritesServiceMessagesToConsoleWithoutReportFile()
+  {
+    // Arrange
+    string testName = TestContext.Current.TestCase!.TestMethodName!;
+    using var testProject = CreateTestProject(testName, includeSimpleTest: true);
+    await BuildProject(testProject.SolutionPath);
+
+    // Act
+    var result = await RunTestsWithCoverage(
+      testProject,
+      "--coverlet --coverlet-output-format teamcity",
+      testName);
+
+    TestContext.Current?.AddAttachment("Test Output", result.CombinedOutput);
+
+    // Assert - test run succeeded
+    Assert.True(result.ExitCode == 0, $"Expected successful test run (exit code 0) but got {result.ExitCode} -> '{result.ErrorText}'.\n\n{result.CombinedOutput}");
+
+    // Assert - no coverage report file was written to disk at all
+    string[] allCoverageFiles = Directory.GetFiles(
+      testProject.OutputDirectory,
+      "coverage.*",
+      SearchOption.AllDirectories);
+
+    Assert.True(allCoverageFiles.Length == 0,
+      $"Expected no coverage report files on disk for teamcity-only format, but found:\n" +
+      $"{string.Join("\n", allCoverageFiles.Select(f => $"  - {f}"))}\n\n{result.CombinedOutput}");
+
+    // Assert - teamcity service messages appear in standard output as standalone lines
+    Assert.True(
+      result.StandardOutput.Split('\n').Any(line => line.TrimStart().StartsWith("##teamcity[", StringComparison.Ordinal)),
+      $"Expected at least one output line starting with '##teamcity[' in standard output.\n\n{result.CombinedOutput}");
+  }
+
+  [Fact]
+  public async Task CoverageWithJsonFormat_SummaryTableAppearsInConsoleOutput()
+  {
+    // Arrange
+    string testName = TestContext.Current.TestCase!.TestMethodName!;
+    using var testProject = CreateTestProject(testName, includeSimpleTest: true, includeBranchTest: true);
+    await BuildProject(testProject.SolutionPath);
+
+    // Act
+    var result = await RunTestsWithCoverage(
+      testProject,
+      "--coverlet --coverlet-output-format json",
+      testName);
+
+    TestContext.Current?.AddAttachment("Test Output", result.CombinedOutput);
+
+    // Assert - test run succeeded
+    Assert.True(result.ExitCode == 0, $"Expected successful test run (exit code 0) but got {result.ExitCode} -> '{result.ErrorText}'.\n\n{result.CombinedOutput}");
+
+    // Assert - MTP summary appears with module and aggregate rows
+    Assert.True(result.StandardOutput.Contains("Code Coverage Summary:"),
+      $"Expected code coverage summary in standard output.\n\n{result.CombinedOutput}");
+
+    Assert.True(result.StandardOutput.Contains("SampleLibrary.dll - Branch:"),
+      $"Expected module branch coverage for SampleLibrary.dll in standard output.\n\n{result.CombinedOutput}");
+
+    Assert.True(result.StandardOutput.Contains("Total - Branch:"),
+      $"Expected total branch coverage in standard output.\n\n{result.CombinedOutput}");
+
+    Assert.False(result.StandardOutput.Contains("Total - Branch: N/A"),
+      $"Expected total branch coverage to be numeric, but it was N/A.\n\n{result.CombinedOutput}");
+
+    Assert.False(result.StandardOutput.Contains("SampleLibrary.dll - Branch: N/A"),
+      $"Expected module branch coverage to be numeric, but it was N/A.\n\n{result.CombinedOutput}");
+  }
+
+  [Fact]
+  public async Task MultipleCoverageFormats_WithResultsDirectory()
+  {
+    // Arrange
+    string testName = TestContext.Current.TestCase!.TestMethodName!;
+    using var testProject = CreateTestProject(testName, includeSimpleTest: true);
+    await BuildProject(testProject.SolutionPath);
+
+    // Create a specific results directory
+    string resultsDirectory = Path.GetFullPath(Path.Combine(testProject.SolutionDirectory, RepoRoot, "artifacts", "tmp", "TestResults"));
+    if (Directory.Exists(resultsDirectory))
+    {
+      Directory.Delete(resultsDirectory, recursive: true);
+    }
+    Directory.CreateDirectory(resultsDirectory);
+
+    // Act
+    var result = await RunTestsWithCoverage(
+      testProject,
+      $"--coverlet --coverlet-output-format json --coverlet-output-format cobertura --coverlet-output-format lcov --report-xunit-trx --results-directory \"{resultsDirectory}\"",
+      testName);
+
+    TestContext.Current?.AddAttachment("Test Output", result.CombinedOutput);
+
+    // Assert - Test should pass
+    Assert.True(result.ExitCode == 0, $"Expected successful test run (exit code 0) but got {result.ExitCode} -> '{result.ErrorText}'.\n\n{result.CombinedOutput}");
+
+    // Verify coverage files are generated in the specified results directory
+    string[] jsonFiles = Directory.GetFiles(resultsDirectory, CoverageJsonFileName.Insert(CoverageJsonFileName.LastIndexOf('.'), ".*"), SearchOption.AllDirectories);
+    string[] coberturaFiles = Directory.GetFiles(resultsDirectory, CoverageCoberturaFileName.Insert(CoverageCoberturaFileName.LastIndexOf('.'), ".*"), SearchOption.AllDirectories);
+    string[] lcovFiles = Directory.GetFiles(resultsDirectory, CoverageLcovFileName.Insert(CoverageLcovFileName.LastIndexOf('.'), ".*"), SearchOption.AllDirectories);
+
+    Assert.True(jsonFiles.Length > 0,
+      $"No {CoverageJsonFileName} found in results directory: {resultsDirectory}\n" +
+      $"Files in directory: {string.Join(", ", Directory.GetFiles(resultsDirectory, "*", SearchOption.AllDirectories))}\n\n" +
+      $"Test Output:\n{result.CombinedOutput}");
+
+    Assert.True(coberturaFiles.Length > 0,
+      $"No {CoverageCoberturaFileName} found in results directory: {resultsDirectory}\n" +
+      $"Files in directory: {string.Join(", ", Directory.GetFiles(resultsDirectory, "*", SearchOption.AllDirectories))}\n\n" +
+      $"Test Output:\n{result.CombinedOutput}");
+
+    Assert.True(lcovFiles.Length > 0,
+      $"No {CoverageLcovFileName} found in results directory: {resultsDirectory}\n" +
+      $"Files in directory: {string.Join(", ", Directory.GetFiles(resultsDirectory, "*", SearchOption.AllDirectories))}\n\n" +
+      $"Test Output:\n{result.CombinedOutput}");
+
+    // Verify console output contains "Coverage reports generated:" message
+    Assert.Contains("Out of process file artifacts produced:", result.StandardOutput);
+    Assert.Contains(jsonFiles[0], result.StandardOutput);
+    Assert.Contains(coberturaFiles[0], result.StandardOutput);
+  }
+
+  private static void CheckCoverageResult(TestProjectInfo testProject, TestResult result, string filename)
+  {
+    // Check if output directory exists before searching for coverage files
+    Assert.True(
+      Directory.Exists(testProject.OutputDirectory),
+      $"Coverage output directory does not exist: {testProject.OutputDirectory}\n" +
+      $"This may indicate that coverage collection failed or the test executable was not built correctly.\n\n" +
+      $"Test Output:\n{result.CombinedOutput}");
+
+    string[] coverageFiles = Directory.GetFiles(testProject.OutputDirectory, filename.Insert(filename.LastIndexOf('.'), ".*"), SearchOption.AllDirectories);
+    Assert.True(
+      coverageFiles.Length > 0,
+      $"No coverage file '{filename}' found in '{testProject.OutputDirectory}'.\n" +
+      $"Coverage collection may have failed. Check if --coverlet flag is being processed correctly.\n\n" +
+      $"Test Output:\n{result.CombinedOutput}");
+
+    if (filename == CoverageJsonFileName)
+    {
+      // JSON format structure:
+      // { "ModuleName.dll": { "SourceFile.cs": { "Namespace.Class": { "MethodSignature": { "Lines": {...}, "Branches": [...] } } } } }
+      var coverageData = ParseCoverageJson(coverageFiles[0]);
+      Assert.NotNull(coverageData);
+
+      // Check that we have at least one module (top-level property)
+      bool hasModules = false;
+      bool hasLines = false;
+
+      foreach (var module in coverageData.RootElement.EnumerateObject())
+      {
+        if (module.Name.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
+        {
+          hasModules = true;
+
+          // Enumerate documents (source files)
+          foreach (var document in module.Value.EnumerateObject())
+          {
+            // Enumerate classes
+            foreach (var classEntry in document.Value.EnumerateObject())
+            {
+              // Enumerate methods
+              foreach (var method in classEntry.Value.EnumerateObject())
+              {
+                // Check for Lines property
+                if (method.Value.TryGetProperty("Lines", out var lines) &&
+                    lines.ValueKind == JsonValueKind.Object &&
+                    lines.EnumerateObject().Any())
+                {
+                  hasLines = true;
+                  break;
+                }
+              }
+              if (hasLines) break;
+            }
+            if (hasLines) break;
+          }
+        }
+        if (hasLines) break;
+      }
+
+      Assert.True(hasModules,
+        $"{CoverageJsonFileName} file has no modules (no .dll entries found at root level).\n" +
+        $"Coverage file: {coverageFiles[0]}\n\n" +
+        $"Test Output:\n{result.CombinedOutput}");
+
+      Assert.True(hasLines,
+        $"{CoverageJsonFileName} file has no line coverage data.\n" +
+        $"Coverage file: {coverageFiles[0]}\n\n" +
+        $"Test Output:\n{result.CombinedOutput}");
+    }
+
+    if (filename == CoverageCoberturaFileName)
+    {
+      // Cobertura XML format structure:
+      // <coverage><sources><source>...</source></sources><packages><package><classes><class>...</class></classes></package></packages></coverage>
+      XDocument coberturaDoc = XDocument.Load(coverageFiles[0]);
+      Assert.NotNull(coberturaDoc.Root);
+      Assert.True(coberturaDoc.Root.Name.LocalName == "coverage",
+        $"{CoverageCoberturaFileName} XML root element is not 'coverage'");
+
+      XElement? sourcesElement = coberturaDoc.Root.Element("sources");
+      Assert.True(
+        sourcesElement != null,
+        $"{CoverageCoberturaFileName} XML file is missing 'sources' element.\n" +
+        $"Coverage file: {coverageFiles[0]}\n\n" +
+        $"Test Output:\n{result.CombinedOutput}");
+
+      bool hasSourceEntries = sourcesElement.Elements("source").Any();
+      Assert.True(
+        hasSourceEntries,
+        $"{CoverageCoberturaFileName} XML 'sources' element is empty - no source directories were recorded.\n" +
+        $"This indicates coverage instrumentation may have failed.\n" +
+        $"Coverage file: {coverageFiles[0]}\n\n" +
+        $"Test Output:\n{result.CombinedOutput}");
+
+      XElement? packagesElement = coberturaDoc.Root.Element("packages");
+      Assert.True(
+        packagesElement != null && packagesElement.Elements("package").Any(),
+        $"{CoverageCoberturaFileName} XML 'packages' element is empty - no coverage data was collected.\n" +
+        $"Coverage file: {coverageFiles[0]}\n\n" +
+        $"Test Output:\n{result.CombinedOutput}");
+
+      // Verify we have actual line coverage data
+      bool hasLineCoverage = packagesElement
+        .Descendants("line")
+        .Any(line => line.Attribute("hits") != null);
+
+      Assert.True(
+        hasLineCoverage,
+        $"{CoverageCoberturaFileName} XML has no line coverage data (no <line> elements with hits).\n" +
+        $"Coverage file: {coverageFiles[0]}\n\n" +
+        $"Test Output:\n{result.CombinedOutput}");
+    }
+  }
+
+  #region Helper Methods
+  private static void DeleteDirectoryWithRetry(string path, int maxRetries = 3)
+  {
+    if (!Directory.Exists(path))
+      return;
+
+    for (int i = 0; i < maxRetries; i++)
+    {
+      try
+      {
+        foreach (string file in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
+        {
+          File.SetAttributes(file, FileAttributes.Normal);
+        }
+        Directory.Delete(path, recursive: true);
+        return;
+      }
+      catch (IOException) when (i < maxRetries - 1)
+      {
+        Thread.Sleep(100 * (i + 1));
+      }
+      catch (UnauthorizedAccessException) when (i < maxRetries - 1)
+      {
+        Thread.Sleep(100 * (i + 1));
+      }
+    }
+  }
+
+  /// <summary>
+  /// Issue #1843: Test that async methods in SUT classes generate proper coverage data.
+  /// When both classes have async methods, coverage should NOT be empty.
+  /// </summary>
+  [Fact]
+  public async Task Issue1843_AsyncMethods_CoverageDataNotEmpty()
+  {
+    // Arrange - Create test project with MULTIPLE classes that ALL have async methods
+    string testName = TestContext.Current.TestCase!.TestMethodName!;
+    using var testProject = CreateAsyncTestProject(testName);
+    await BuildProject(testProject.SolutionPath);
+
+    // Act - Run with cobertura format to match repro
+    var result = await RunTestsWithCoverage(testProject, "--coverlet --coverlet-output-format cobertura", testName);
+
+    TestContext.Current?.AddAttachment("Test Output", result.CombinedOutput);
+
+    // Assert test passed
+    Assert.True(result.ExitCode == 0, $"Expected successful test run (exit code 0) but got {result.ExitCode} -> '{result.ErrorText}'.\n\n{result.CombinedOutput}");
+
+    // Find cobertura coverage file
+    string[] coverageFiles = Directory.GetFiles(testProject.OutputDirectory, CoverageCoberturaFileName.Insert(CoverageCoberturaFileName.LastIndexOf('.'), ".*"), SearchOption.AllDirectories);
+    Assert.NotEmpty(coverageFiles);
+
+    // Parse coverage XML
+    string xmlContent = File.ReadAllText(coverageFiles[0]);
+    XDocument coberturaDoc = XDocument.Parse(xmlContent);
+
+    // CRITICAL ASSERTION for Issue #1843:
+    // Coverage must contain classes - when both SUT classes have async methods,
+    // the coverage was becoming completely empty (<classes />)
+    var classElements = coberturaDoc.Descendants("class").ToList();
+    Assert.True(classElements.Count > 0,
+      $"[Issue #1843] CRITICAL: Coverage data is EMPTY! No <class> elements found.\n" +
+      $"This is the exact issue #1843 symptom: when both SUT classes have async methods, coverage becomes empty.\n" +
+      $"Coverage file: {coverageFiles[0]}\n\n" +
+      $"XML Content:\n{xmlContent}\n\n" +
+      $"Test Output:\n{result.CombinedOutput}");
+
+    // Verify we have line coverage data
+    var lineElements = coberturaDoc.Descendants("line").ToList();
+    Assert.True(lineElements.Count > 0,
+      $"[Issue #1843] Coverage has classes but no <line> elements.\n" +
+      $"Found {classElements.Count} class(es), but 0 line coverage.\n" +
+      $"Coverage file: {coverageFiles[0]}\n\n" +
+      $"XML Content:\n{xmlContent}");
+
+    // Verify specific async methods are covered
+    var methods = coberturaDoc.Descendants("method").ToList();
+    bool foundAsyncMethod = methods.Any(m =>
+    {
+      var name = m.Attribute("name")?.Value ?? "";
+      return name.Contains("Async") || name.Contains("MoveNext");
+    });
+
+    // Log all found methods for debugging
+    string foundMethods = string.Join("\n", methods.Select(m => $"  - {m.Attribute("name")?.Value}"));
+
+    Assert.True(foundAsyncMethod || methods.Count > 0,
+      $"[Issue #1843] Expected to find async methods in coverage.\n" +
+      $"Found {methods.Count} method(s):\n{foundMethods}\n\n" +
+      $"Coverage file: {coverageFiles[0]}");
+  }
+
+  /// <summary>
+  /// Issue #1843: Specifically tests the scenario where StringLengthCalculator is async
+  /// and IntegerFormatter is also async - this combination was causing empty coverage.
+  /// </summary>
+  [Fact]
+  public async Task Issue1843_BothClassesAsync_CoverageNotEmpty()
+  {
+    // Arrange - Reproduce exact issue #1843 scenario
+    string testName = TestContext.Current.TestCase!.TestMethodName!;
+    using var testProject = CreateIssue1843ExactReproProject(testName);
+    await BuildProject(testProject.SolutionPath);
+
+    // Act
+    var result = await RunTestsWithCoverage(testProject, "--coverlet --coverlet-output-format cobertura", testName);
+
+    TestContext.Current?.AddAttachment("Test Output", result.CombinedOutput);
+
+    // Assert
+    Assert.True(result.ExitCode == 0, $"Test run failed with exit code {result.ExitCode}.\n\n{result.CombinedOutput}");
+
+    // Find and parse coverage
+    string[] coverageFiles = Directory.GetFiles(testProject.OutputDirectory, CoverageCoberturaFileName.Insert(CoverageCoberturaFileName.LastIndexOf('.'), ".*"), SearchOption.AllDirectories);
+    Assert.NotEmpty(coverageFiles);
+
+    string xmlContent = File.ReadAllText(coverageFiles[0]);
+    XDocument doc = XDocument.Parse(xmlContent);
+
+    // Verify both classes appear in coverage
+    var classElements = doc.Descendants("class").ToList();
+    var classNames = classElements.Select(c => c.Attribute("name")?.Value).ToList();
+
+    Assert.True(classElements.Count >= 2,
+      $"[Issue #1843 REPRO] Expected at least 2 classes in coverage, but found {classElements.Count}.\n" +
+      $"Classes found: {string.Join(", ", classNames)}\n" +
+      $"This reproduces Issue #1843: 'both methods are async' scenario causes empty coverage.\n\n" +
+      $"XML Content:\n{xmlContent}");
+
+    // Verify line coverage exists
+    bool hasLineCoverage = doc.Descendants("line").Any();
+    Assert.True(hasLineCoverage,
+      $"[Issue #1843 REPRO] Classes found but no line coverage data.\n" +
+      $"This is the exact symptom: <classes /> is empty or has no line data.\n\n" +
+      $"XML Content:\n{xmlContent}");
+  }
+
+  private TestProjectInfo CreateAsyncTestProject(string testName)
+  {
+    string artifactsTemp = Path.Combine(RepoRoot, "artifacts", "tmp", BuildConfiguration.ToLowerInvariant());
+    Directory.CreateDirectory(artifactsTemp);
+
+    string solutionPath = CreateSolutionDirectory(artifactsTemp, "MTP_", SanitizePathName(testName));
+
+    string sutProjectPath = Path.Combine(solutionPath, SutProjectName);
+    string testProjectPath = Path.Combine(solutionPath, TestProjectName);
+    Directory.CreateDirectory(sutProjectPath);
+    Directory.CreateDirectory(testProjectPath);
+
+    CreateNugetConfig(solutionPath);
+    string coverletMtpVersion = GetCoverletMtpPackageVersion();
+
+    CreateAsyncSutLibraryProject(sutProjectPath);
+    CreateAsyncTestProjectFiles(testProjectPath, coverletMtpVersion);
+
+    string solutionFile = Path.Combine(solutionPath, "TestSolution.sln");
+    CreateSolutionFile(solutionFile);
+
+    string outputPath = Path.Combine(solutionPath, "bin", TestProjectName, BuildConfiguration.ToLower());
+    return new TestProjectInfo(solutionFile, testProjectPath, outputPath, solutionPath);
+  }
+
+  private TestProjectInfo CreateIssue1843ExactReproProject(string testName)
+  {
+    string artifactsTemp = Path.Combine(RepoRoot, "artifacts", "tmp", BuildConfiguration.ToLowerInvariant());
+    Directory.CreateDirectory(artifactsTemp);
+
+    string solutionPath = CreateSolutionDirectory(artifactsTemp, "MTP_", SanitizePathName(testName));
+
+    string sutProjectPath = Path.Combine(solutionPath, SutProjectName);
+    string testProjectPath = Path.Combine(solutionPath, TestProjectName);
+    Directory.CreateDirectory(sutProjectPath);
+    Directory.CreateDirectory(testProjectPath);
+
+    CreateNugetConfig(solutionPath);
+    string coverletMtpVersion = GetCoverletMtpPackageVersion();
+
+    CreateIssue1843SutProject(sutProjectPath);
+    CreateIssue1843TestProject(testProjectPath, coverletMtpVersion);
+
+    string solutionFile = Path.Combine(solutionPath, "TestSolution.sln");
+    CreateSolutionFile(solutionFile);
+
+    string outputPath = Path.Combine(solutionPath, "bin", TestProjectName, BuildConfiguration.ToLower());
+    return new TestProjectInfo(solutionFile, testProjectPath, outputPath, solutionPath);
+  }
+
+  private static void CreateAsyncSutLibraryProject(string sutProjectPath)
+  {
+    string sutCsproj = Path.Combine(sutProjectPath, $"{SutProjectName}.csproj");
+    File.WriteAllText(sutCsproj, $@"<Project Sdk=""Microsoft.NET.Sdk"">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12.0</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <UseArtifactsOutput>true</UseArtifactsOutput>
+    <ArtifactsPath>$(MSBuildThisFileDirectory)..</ArtifactsPath>
+    <DebugType>portable</DebugType>
+  </PropertyGroup>
+</Project>");
+
+    // Generate SUT with MULTIPLE classes ALL having async methods
+    string sutCode = @"// Copyright (c) Toni Solarin-Sodara
+// Licensed under the MIT license. See LICENSE file in the project root for full license information.
+
+// Issue #1843: Test SUT with multiple async classes
+namespace SampleLibrary;
+
+/// <summary>
+/// First class with async methods - async calculator
+/// </summary>
+public class AsyncCalculator
+{
+    public async Task<int> AddAsync(int a, int b)
+    {
+        await Task.Delay(1);
+        return a + b;
+    }
+
+    public async Task<int> MultiplyAsync(int a, int b)
+    {
+        await Task.Delay(1);
+        return a * b;
+    }
+}
+
+/// <summary>
+/// Second class with async methods - async string processor
+/// Issue #1843: When BOTH classes have async methods, coverage becomes empty
+/// </summary>
+public class AsyncStringProcessor
+{
+    public async Task<string> ProcessAsync(string input)
+    {
+        await Task.Delay(1);
+        return input.ToUpper();
+    }
+
+    public async Task<int> GetLengthAsync(string input)
+    {
+        await Task.Delay(1);
+        return input.Length;
+    }
+}
+
+/// <summary>
+/// Third async class to ensure the issue is reproducible with multiple async classes
+/// </summary>
+public class AsyncDataFetcher
+{
+    public async Task<string> FetchDataAsync(string key)
+    {
+        await Task.Delay(1);
+        return $""Data for {key}"";
+    }
+}
+";
+    File.WriteAllText(Path.Combine(sutProjectPath, "AsyncClasses.cs"), sutCode);
+  }
+
+  private static void CreateAsyncTestProjectFiles(string testProjectPath, string coverletMtpVersion)
+  {
+    string relativeSutPath = Path.Combine("..", SutProjectName, $"{SutProjectName}.csproj");
+
+    string testCsproj = Path.Combine(testProjectPath, $"{TestProjectName}.csproj");
+    File.WriteAllText(testCsproj, GenerateTestCsproj(coverletMtpVersion, relativeSutPath));
+
+    string testCode = @"// Copyright (c) Toni Solarin-Sodara
+// Licensed under the MIT license. See LICENSE file in the project root for full license information.
+
+// Issue #1843: Test async methods coverage
+using Xunit;
+using SampleLibrary;
+
+namespace TestProject;
+
+public class AsyncCalculatorTests
+{
+    [Fact]
+    public async Task AddAsync_TwoNumbers_ReturnsSum()
+    {
+        var calc = new AsyncCalculator();
+        int result = await calc.AddAsync(2, 3);
+        Assert.Equal(5, result);
+    }
+
+    [Fact]
+    public async Task MultiplyAsync_TwoNumbers_ReturnsProduct()
+    {
+        var calc = new AsyncCalculator();
+        int result = await calc.MultiplyAsync(4, 5);
+        Assert.Equal(20, result);
+    }
+}
+
+public class AsyncStringProcessorTests
+{
+    [Fact]
+    public async Task ProcessAsync_String_ReturnsUpperCase()
+    {
+        var processor = new AsyncStringProcessor();
+        string result = await processor.ProcessAsync(""hello"");
+        Assert.Equal(""HELLO"", result);
+    }
+
+    [Fact]
+    public async Task GetLengthAsync_String_ReturnsLength()
+    {
+        var processor = new AsyncStringProcessor();
+        int result = await processor.GetLengthAsync(""test"");
+        Assert.Equal(4, result);
+    }
+}
+
+public class AsyncDataFetcherTests
+{
+    [Fact]
+    public async Task FetchDataAsync_Key_ReturnsData()
+    {
+        var fetcher = new AsyncDataFetcher();
+        string result = await fetcher.FetchDataAsync(""mykey"");
+        Assert.Contains(""mykey"", result);
+    }
+}
+";
+    File.WriteAllText(Path.Combine(testProjectPath, "AsyncTests.cs"), testCode);
+  }
+
+  private static void CreateIssue1843SutProject(string sutProjectPath)
+  {
+    // Exact repro of Issue #1843 scenario
+    string sutCsproj = Path.Combine(sutProjectPath, $"{SutProjectName}.csproj");
+    File.WriteAllText(sutCsproj, $@"<Project Sdk=""Microsoft.NET.Sdk"">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12.0</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <UseArtifactsOutput>true</UseArtifactsOutput>
+    <ArtifactsPath>$(MSBuildThisFileDirectory)..</ArtifactsPath>
+    <DebugType>portable</DebugType>
+  </PropertyGroup>
+</Project>");
+
+    // Exact Issue #1843 scenario: StringLengthCalculator and IntegerFormatter both with async methods
+    string sutCode = @"// Copyright (c) Toni Solarin-Sodara
+// Licensed under the MIT license. See LICENSE file in the project root for full license information.
+
+// Issue #1843 Exact Repro: Both classes have async methods
+namespace SampleLibrary;
+
+/// <summary>
+/// Issue #1843 Case 2: StringLengthCalculator with async method
+/// </summary>
+public class StringLengthCalculator
+{
+    public async Task<int> CalculateLengthAsync(string input)
+    {
+        await Task.Delay(1);
+        return input?.Length ?? 0;
+    }
+}
+
+/// <summary>
+/// Issue #1843 Case 2: IntegerFormatter with async method
+/// When BOTH classes have async methods, coverage was becoming EMPTY
+/// </summary>
+public class IntegerFormatter
+{
+    public async Task<string> FormatToStringAsync(int value)
+    {
+        await Task.Delay(1);
+        return value.ToString();
+    }
+}
+";
+    File.WriteAllText(Path.Combine(sutProjectPath, "Issue1843Classes.cs"), sutCode);
+  }
+
+  private static void CreateIssue1843TestProject(string testProjectPath, string coverletMtpVersion)
+  {
+    string relativeSutPath = Path.Combine("..", SutProjectName, $"{SutProjectName}.csproj");
+
+    string testCsproj = Path.Combine(testProjectPath, $"{TestProjectName}.csproj");
+    File.WriteAllText(testCsproj, GenerateTestCsproj(coverletMtpVersion, relativeSutPath));
+
+    string testCode = @"// Copyright (c) Toni Solarin-Sodara
+// Licensed under the MIT license. See LICENSE file in the project root for full license information.
+
+// Issue #1843 Exact Repro Test
+using Xunit;
+using SampleLibrary;
+
+namespace TestProject;
+
+public class Issue1843Tests
+{
+    [Fact]
+    public async Task StringLengthCalculator_CalculateLengthAsync_ReturnsLength()
+    {
+        var calc = new StringLengthCalculator();
+        int result = await calc.CalculateLengthAsync(""test"");
+        Assert.Equal(4, result);
+    }
+
+    [Fact]
+    public async Task IntegerFormatter_FormatToStringAsync_ReturnsString()
+    {
+        var formatter = new IntegerFormatter();
+        string result = await formatter.FormatToStringAsync(42);
+        Assert.Equal(""42"", result);
+    }
+}
+";
+    File.WriteAllText(Path.Combine(testProjectPath, "Issue1843Tests.cs"), testCode);
+  }
+
+  private TestProjectInfo CreateTestProject(
+    string testName,
+    bool includeSimpleTest = false,
+    bool includeMethodTests = false,
+    bool includeMultipleClasses = false,
+    bool includeCalculatorTest = false,
+    bool includeBranchTest = false,
+    bool includeMultipleTests = false)
+  {
+    string artifactsTemp = Path.Combine(RepoRoot, "artifacts", "tmp", BuildConfiguration.ToLowerInvariant());
+    Directory.CreateDirectory(artifactsTemp);
+
+    string solutionPath = CreateSolutionDirectory(artifactsTemp, "MTP_", SanitizePathName(testName));
+
+    string sutProjectPath = Path.Combine(solutionPath, SutProjectName);
+    string testProjectPath = Path.Combine(solutionPath, TestProjectName);
+    Directory.CreateDirectory(sutProjectPath);
+    Directory.CreateDirectory(testProjectPath);
+
+    CreateNugetConfig(solutionPath);
+    string coverletMtpVersion = GetCoverletMtpPackageVersion();
+
+    CreateSutLibraryProject(sutProjectPath, includeSimpleTest, includeMethodTests, includeCalculatorTest, includeBranchTest, includeMultipleClasses);
+    CreateTestProjectFiles(testProjectPath, coverletMtpVersion, includeSimpleTest, includeMethodTests, includeCalculatorTest, includeBranchTest, includeMultipleTests, includeMultipleClasses);
+
+    string solutionFile = Path.Combine(solutionPath, "TestSolution.sln");
+    CreateSolutionFile(solutionFile);
+
+    string outputPath = Path.Combine(solutionPath, "bin", TestProjectName, BuildConfiguration.ToLower());
+    return new TestProjectInfo(solutionFile, testProjectPath, outputPath, solutionPath);
+  }
+
+  private static void CreateSutLibraryProject(string sutProjectPath,
+    bool includeSimpleTest,
+    bool includeMethodTests,
+    bool includeCalculatorTest,
+    bool includeBranchTest,
+    bool includeMultipleClasses)
+  {
+    // Create SUT library .csproj
+    string sutCsproj = Path.Combine(sutProjectPath, $"{SutProjectName}.csproj");
+    File.WriteAllText(sutCsproj, $@"<Project Sdk=""Microsoft.NET.Sdk"">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12.0</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <UseArtifactsOutput>true</UseArtifactsOutput>
+    <ArtifactsPath>$(MSBuildThisFileDirectory)..</ArtifactsPath>
+    <DebugType>portable</DebugType>
+  </PropertyGroup>
+</Project>");
+
+    // Generate SUT code
+    string sutCode = GenerateSutCode(includeSimpleTest, includeMethodTests, includeCalculatorTest, includeBranchTest, includeMultipleClasses);
+    File.WriteAllText(Path.Combine(sutProjectPath, "SampleClasses.cs"), sutCode);
+  }
+
+  private static void CreateTestProjectFiles(string testProjectPath, string coverletMtpVersion,
+    bool includeSimpleTest,
+    bool includeMethodTests,
+    bool includeCalculatorTest,
+    bool includeBranchTest,
+    bool includeMultipleTests,
+    bool includeMultipleClasses)
+  {
+    // Relative path from test project to SUT project
+    string relativeSutPath = Path.Combine("..", SutProjectName, $"{SutProjectName}.csproj");
+
+    string testCsproj = Path.Combine(testProjectPath, $"{TestProjectName}.csproj");
+    File.WriteAllText(testCsproj, GenerateTestCsproj(coverletMtpVersion, relativeSutPath));
+
+    string testCode = GenerateTestCode(includeSimpleTest, includeMethodTests, includeCalculatorTest, includeBranchTest, includeMultipleTests, includeMultipleClasses);
+    File.WriteAllText(Path.Combine(testProjectPath, "Tests.cs"), testCode);
+  }
+
+  private static string GenerateSutCode(
+    bool includeSimpleTest,
+    bool includeMethodTests,
+    bool includeCalculatorTest,
+    bool includeBranchTest,
+    bool includeMultipleClasses)
+  {
+    var codeBuilder = new System.Text.StringBuilder();
+    codeBuilder.AppendLine("// Copyright (c) Toni Solarin-Sodara");
+    codeBuilder.AppendLine("// Licensed under the MIT license. See LICENSE file in the project root for full license information.");
+    codeBuilder.AppendLine();
+    codeBuilder.AppendLine($"namespace {SutProjectName};");
+
+    if (includeSimpleTest)
+    {
+      codeBuilder.AppendLine(@"/// <summary>
+/// Simple math operations for testing basic coverage scenarios.
+/// </summary>
+public class SimpleMath
+{
+  public int Add(int a, int b)
+  {
+    return a + b;
+  }
+
+  public int Subtract(int a, int b)
+  {
+    return a - b;
+  }
+}");
+    }
+
+    if (includeMethodTests)
+    {
+      codeBuilder.AppendLine(@"
+/// <summary>
+/// System under test with calculation methods.
+/// </summary>
+public class SystemUnderTest
+{
+  public int Calculate(int x, int y)
+  {
+    int temp = x + y;
+    return temp;
+  }
+
+  public int Multiply(int x, int y)
+  {
+    return x * y;
+  }
+}");
+    }
+
+    if (includeCalculatorTest)
+    {
+      codeBuilder.AppendLine(@"
+/// <summary>
+/// Calculator class with basic arithmetic operations.
+/// </summary>
+public class Calculator
+{
+  public int Add(int a, int b) => a + b;
+
+  public int Multiply(int a, int b) => a * b;
+
+  public int Divide(int a, int b)
+  {
+    if (b == 0)
+      throw new DivideByZeroException();
+    return a / b;
+  }
+}");
+    }
+
+    if (includeBranchTest)
+    {
+      codeBuilder.AppendLine(@"
+/// <summary>
+/// Class with branching logic for testing branch coverage.
+/// </summary>
+public class BranchLogic
+{
+  public string CheckValue(int value)
+  {
+    if (value > 0)
+    {
+      return ""Positive"";
+    }
+    else if (value < 0)
+    {
+      return ""Negative"";
+    }
+    return ""Zero"";
+  }
+
+  public string GetGrade(int score)
+  {
+    return score switch
+    {
+      >= 90 => ""A"",
+      >= 80 => ""B"",
+      >= 70 => ""C"",
+      >= 60 => ""D"",
+      _ => ""F""
+    };
+  }
+}");
+    }
+
+    if (includeMultipleClasses)
+    {
+      codeBuilder.AppendLine(@"
+/// <summary>
+/// Additional class for multi-class coverage scenarios.
+/// </summary>
+public class StringHelper
+{
+  public string Reverse(string input)
+  {
+    if (string.IsNullOrEmpty(input))
+      return input;
+
+    char[] chars = input.ToCharArray();
+    Array.Reverse(chars);
+    return new string(chars);
+  }
+}
+
+/// <summary>
+/// Class that should be excluded from coverage in some tests.
+/// </summary>
+public class ExcludedClass
+{
+  public void ExcludedMethod()
+  {
+    // This method might be excluded from coverage
+  }
+}");
+    }
+
+    return codeBuilder.ToString();
+  }
+
+  private static string GenerateTestCode(
+    bool includeSimpleTest,
+    bool includeMethodTests,
+    bool includeCalculatorTest,
+    bool includeBranchTest,
+    bool includeMultipleTests,
+    bool includeMultipleClasses)
+  {
+    var codeBuilder = new System.Text.StringBuilder();
+    codeBuilder.AppendLine("// Copyright (c) Toni Solarin-Sodara");
+    codeBuilder.AppendLine("// Licensed under the MIT license. See LICENSE file in the project root for full license information.");
+    codeBuilder.AppendLine();
+    codeBuilder.AppendLine("using Xunit;");
+    codeBuilder.AppendLine($"using {SutProjectName};");
+    codeBuilder.AppendLine();
+    codeBuilder.AppendLine($"namespace {TestProjectName};");
+
+    if (includeSimpleTest)
+    {
+      codeBuilder.AppendLine(@"
+public class SimpleMathTests
+{
+  [Fact]
+  public void Add_TwoPositiveNumbers_ReturnsSum()
+  {
+    // Arrange
+    var math = new SimpleMath();
+
+    // Act
+    int result = math.Add(2, 3);
+
+    // Assert
+    Assert.Equal(5, result);
+  }
+
+  [Fact]
+  public void Subtract_TwoNumbers_ReturnsDifference()
+  {
+    var math = new SimpleMath();
+    int result = math.Subtract(10, 4);
+    Assert.Equal(6, result);
+  }
+}");
+    }
+
+    if (includeMethodTests)
+    {
+      codeBuilder.AppendLine(@"
+public class SystemUnderTestTests
+{
+  [Fact]
+  public void Calculate_AddsTwoNumbers_ReturnsCorrectResult()
+  {
+    // Arrange
+    var sut = new SystemUnderTest();
+
+    // Act
+    int result = sut.Calculate(10, 5);
+
+    // Assert
+    Assert.Equal(15, result);
+  }
+
+  [Fact]
+  public void Multiply_TwoNumbers_ReturnsProduct()
+  {
+    var sut = new SystemUnderTest();
+    int result = sut.Multiply(3, 4);
+    Assert.Equal(12, result);
+  }
+}");
+    }
+
+    if (includeCalculatorTest)
+    {
+      codeBuilder.AppendLine(@"
+public class CalculatorTests
+{
+  [Fact]
+  public void Calculator_Add_ReturnsSum()
+  {
+    var calc = new Calculator();
+    Assert.Equal(10, calc.Add(4, 6));
+  }
+
+  [Fact]
+  public void Calculator_Multiply_ReturnsProduct()
+  {
+    var calc = new Calculator();
+    Assert.Equal(20, calc.Multiply(4, 5));
+  }
+
+  [Fact]
+  public void Calculator_Divide_ReturnsQuotient()
+  {
+    var calc = new Calculator();
+    Assert.Equal(5, calc.Divide(20, 4));
+  }
+
+  [Fact]
+  public void Calculator_DivideByZero_ThrowsException()
+  {
+    var calc = new Calculator();
+    Assert.Throws<DivideByZeroException>(() => calc.Divide(10, 0));
+  }
+}");
+    }
+
+    if (includeBranchTest)
+    {
+      codeBuilder.AppendLine(@"
+public class BranchLogicTests
+{
+  [Fact]
+  public void CheckValue_PositiveNumber_ReturnsPositive()
+  {
+    var logic = new BranchLogic();
+    string result = logic.CheckValue(10);
+    Assert.Equal(""Positive"", result);
+  }
+
+  [Fact]
+  public void CheckValue_NegativeNumber_ReturnsNegative()
+  {
+    var logic = new BranchLogic();
+    string result = logic.CheckValue(-5);
+    Assert.Equal(""Negative"", result);
+  }
+
+  [Fact]
+  public void CheckValue_Zero_ReturnsZero()
+  {
+    var logic = new BranchLogic();
+    string result = logic.CheckValue(0);
+    Assert.Equal(""Zero"", result);
+  }
+
+  [Theory]
+  [InlineData(95, ""A"")]
+  [InlineData(85, ""B"")]
+  [InlineData(75, ""C"")]
+  [InlineData(65, ""D"")]
+  [InlineData(50, ""F"")]
+  public void GetGrade_VariousScores_ReturnsCorrectGrade(int score, string expectedGrade)
+  {
+    var logic = new BranchLogic();
+    string result = logic.GetGrade(score);
+    Assert.Equal(expectedGrade, result);
+  }
+}");
+    }
+
+    if (includeMultipleTests)
+    {
+      codeBuilder.AppendLine(@"
+public class ConcurrentTests
+{
+  [Fact]
+  public void Test1() => Assert.True(true);
+
+  [Fact]
+  public void Test2() => Assert.True(true);
+
+  [Fact]
+  public void Test3() => Assert.True(true);
+}");
+    }
+
+    if (includeMultipleClasses)
+    {
+      codeBuilder.AppendLine(@"
+public class StringHelperTests
+{
+  [Fact]
+  public void Reverse_ValidString_ReturnsReversed()
+  {
+    var helper = new StringHelper();
+    string result = helper.Reverse(""hello"");
+    Assert.Equal(""olleh"", result);
+  }
+
+  [Fact]
+  public void Reverse_EmptyString_ReturnsEmpty()
+  {
+    var helper = new StringHelper();
+    string result = helper.Reverse("""");
+    Assert.Equal("""", result);
+  }
+
+  [Fact]
+  public void Reverse_NullString_ReturnsNull()
+  {
+    var helper = new StringHelper();
+    string? result = helper.Reverse(null!);
+    Assert.Null(result);
+  }
+}");
+    }
+
+    return codeBuilder.ToString();
+  }
+
+  private Task BuildProject(string solutionPath) => BuildProjectAsync(solutionPath);
+
+  private static async Task<TestResult> RunTestsWithCoverage(TestProjectInfo testProject, string arguments, string testName)
+  {
+    string testExecutable = Path.Combine(testProject.OutputDirectory, $"{TestProjectName}.dll");
+
+    if (!File.Exists(testExecutable))
+    {
+      throw new FileNotFoundException(
+        $"Test executable not found: {testExecutable}\n" +
+        $"Build may have failed silently.");
+    }
+
+    string coverletMtpDll = Path.Combine(
+      Path.GetDirectoryName(testExecutable)!,
+      "coverlet.MTP.dll");
+
+    if (!File.Exists(coverletMtpDll))
+    {
+      throw new FileNotFoundException(
+        $"Coverlet MTP extension not found: {coverletMtpDll}\n" +
+        $"The coverlet.MTP NuGet package may not have restored correctly.");
+    }
+
+    string solutionDir = Path.GetDirectoryName(testProject.SolutionPath)!;
+
+    // Exclude coverlet assemblies and test framework assemblies from instrumentation
+    string excludeFilters = "--coverlet-exclude \"[coverlet.*]*\" --coverlet-exclude \"[xunit.*]*\" --coverlet-exclude \"[Microsoft.Testing.*]*\"";
+
+    var processStartInfo = new ProcessStartInfo
+    {
+      FileName = "dotnet",
+      Arguments = $"exec \"{testExecutable}\" {arguments} {excludeFilters} --diagnostic --diagnostic-verbosity trace --diagnostic-output-directory \"{solutionDir}\" --diagnostic-file-prefix {testName}\"",
+      RedirectStandardOutput = true,
+      RedirectStandardError = true,
+      UseShellExecute = false,
+      CreateNoWindow = true,
+      WorkingDirectory = testProject.TestProjectPath
+    };
+
+    using var process = Process.Start(processStartInfo);
+
+    string output = await process!.StandardOutput.ReadToEndAsync();
+    string error = await process.StandardError.ReadToEndAsync();
+
+    await process.WaitForExitAsync();
+
+    string errorContext = process.ExitCode switch
+    {
+      0 => "success, no errors",
+      1 => "unknown errors",
+      2 => "test failure",
+      3 => "test session was aborted",
+      4 => "setup of used extensions is invalid",
+      5 => "command line arguments passed to the test app are invalid",
+      6 => "test session is using a non-implemented feature",
+      7 => "unable to complete successfully (likely crashed)",
+      8 => "test session ran zero tests",
+      9 => "minimum execution policy for the executed tests was violated",
+      10 => "test adapter, Testing.Platform Test Framework, MSTest, NUnit, or xUnit, failed to run tests for an infrastructure reason",
+      11 => "test process will exit if dependent process exits",
+      12 => "test session was unable to run because the client does not support any of the supported protocol versions",
+      13 => "exceeded number of maximum failed tests",
+      14 => "coverage threshold was not met",
+      _ => "unrecognized exit code"
+    };
+
+    return new TestResult(
+      exitCode: process.ExitCode,
+      standardOutput: $"=== TEST EXECUTABLE ===\n{testExecutable}\n\n" +
+                      $"=== ARGUMENTS ===\n{arguments}\n\n" +
+                      $"=== EXIT CODE ===\n{process.ExitCode}\n\n" +
+                      $"=== STDOUT ===\n{output}",
+      errorText: errorContext + "\n\n" + error);
+  }
+
+  private static JsonDocument ParseCoverageJson(string filePath)
+  {
+    string jsonContent = File.ReadAllText(filePath);
+    return JsonDocument.Parse(jsonContent);
+  }
+
+  #endregion
+
+  }
