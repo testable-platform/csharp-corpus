@@ -139,3 +139,34 @@ reports nothing for a given tool can be *proven* correct instead of assumed corr
 Every runner's expected exit code is recorded there, and
 `tool_integration.py --run` exits **2** if any tool produces a result the dataset
 does not already record - a new finding, as distinct from a measurement.
+
+<!-- tools-non-triggering -->
+## Tools non triggering (Synthetic Data)
+
+A fifth per-branch data folder, beside `Tool Clean (Synthetic Data)`,
+`Tool Invalid (Synthetic Data)`, `Tool Triggering (Synthetic Data)` and
+`Tool Triggering (Tool Github Test data)`.
+
+Clean makes each tool run and report nothing wrong. Invalid makes it run and
+report something. This folder holds data with nothing in it for any tool to
+catch -- and, where no program would reach the tool at all, nothing for it to
+start on. It is the negative control that tells *correctly detected nothing*
+apart from *the scan never ran*.
+
+`Tools non triggering (Synthetic Data)/` holds 17 tool-named folders, matching the names in Clean
+and Invalid so the data sets line up name-for-name:
+
+* **8 tools read source**, so they get a minimal program per boundary
+  family (netfx45, netfx46, netcoreapp30, net9, net10) -- one class or one function, no branching, no
+  duplication, no dependency, no dead export, no magic number.
+* **9 tools cannot be answered by a program** -- they read a lockfile,
+  a coverage report, compiled bytecode or the commit history -- so they carry
+  the subject matter as a plain record instead, with the reason stated in that
+  folder's own README.
+
+**No manifest, no lockfile, no tool configuration, no runner and no
+`trigger.yaml` anywhere in it**, so the folder adds no discovered project and
+no task to a run.
+
+See `Tools non triggering (Synthetic Data)/README.md` for the per-tool table, the mechanism each tool is
+inert by, and what was measured.
