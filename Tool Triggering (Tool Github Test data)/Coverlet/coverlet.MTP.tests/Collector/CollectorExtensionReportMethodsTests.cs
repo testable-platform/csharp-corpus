@@ -1,0 +1,1034 @@
+﻿// Copyright (c) Toni Solarin-Sodara
+// Licensed under the MIT license. See LICENSE file in the project root for full license information.
+
+using Coverlet.Core;
+using Coverlet.Core.Abstractions;
+using Coverlet.MTP.CommandLine;
+using Microsoft.Testing.Platform.CommandLine;
+using Microsoft.Testing.Platform.Configurations;
+using Microsoft.Testing.Platform.Extensions.Messages;
+using Microsoft.Testing.Platform.Extensions.OutputDevice;
+using Microsoft.Testing.Platform.Logging;
+using Microsoft.Testing.Platform.Messages;
+using Microsoft.Testing.Platform.OutputDevice;
+using Moq;
+using Xunit;
+
+namespace Coverlet.MTP.Collector.Tests;
+
+/// <summary>
+/// Comprehensive tests for report generation methods in CollectorExtension:
+/// - GenerateCoverageReportFiles
+/// - DisplayGeneratedReportsAsync
+/// - GenerateReportsAsync
+/// - GetHitsFilePath
+/// </summary>
+public class CollectorExtensionReportMethodsTests
+{
+  private readonly Mock<ILoggerFactory> _mockLoggerFactory;
+  private readonly Mock<Microsoft.Testing.Platform.Logging.ILogger> _mockLogger;
+  private readonly Mock<ICommandLineOptions> _mockCommandLineOptions;
+  private readonly Mock<IConfiguration> _mockConfiguration;
+  private readonly Mock<IOutputDevice> _mockOutputDevice;
+  private readonly Mock<IMessageBus> _mockMessageBus;
+  private readonly Mock<IFileSystem> _mockFileSystem;
+  private readonly Mock<ISourceRootTranslator> _mockSourceRootTranslator;
+
+  private static readonly string s_simulatedTestModulePath = CreatePlatformPath("fake", "path", "test.dll");
+  private static readonly string s_simulatedTestModuleDirectory = CreatePlatformPath("fake", "path");
+  private static readonly string s_simulatedReportDirectory = CreatePlatformPath("fake", "reports");
+
+  /// <summary>
+  /// Creates a platform-specific path from path segments.
+  /// This ensures paths work correctly on Windows, Linux, and macOS.
+  /// </summary>
+  /// <param name="segments">Path segments to combine</param>
+  /// <returns>Platform-specific path</returns>
+  private static string CreatePlatformPath(params string[] segments)
+  {
+    // For simulated/fake paths, start with directory separator to make it absolute
+    string basePath = Path.DirectorySeparatorChar.ToString();
+    return Path.Combine(basePath, Path.Combine(segments));
+  }
+
+  public CollectorExtensionReportMethodsTests()
+  {
+    _mockLoggerFactory = new Mock<ILoggerFactory>();
+    _mockLogger = new Mock<Microsoft.Testing.Platform.Logging.ILogger>();
+    _mockCommandLineOptions = new Mock<ICommandLineOptions>();
+    _mockConfiguration = new Mock<IConfiguration>();
+    _mockFileSystem = new Mock<IFileSystem>();
+    _mockOutputDevice = new Mock<IOutputDevice>();
+    _mockMessageBus = new Mock<IMessageBus>();
+    _mockSourceRootTranslator = new Mock<ISourceRootTranslator>();
+
+    _mockLoggerFactory.Setup(x => x.CreateLogger(It.IsAny<string>()))
+      .Returns(_mockLogger.Object);
+
+    SetupDefaultMocks();
+  }
+
+  private void SetupDefaultMocks()
+  {
+    _mockCommandLineOptions
+      .Setup(x => x.IsOptionSet(It.IsAny<string>()))
+      .Returns(false);
+
+    _mockCommandLineOptions
+      .Setup(x => x.TryGetOptionArgumentList(It.IsAny<string>(), out It.Ref<string[]?>.IsAny))
+      .Returns(false);
+
+    _mockConfiguration
+      .Setup(x => x[It.IsAny<string>()])
+      .Returns((string?)null);
+
+    _mockMessageBus
+      .Setup(x => x.PublishAsync(It.IsAny<IDataProducer>(), It.IsAny<IData>()))
+      .Returns(Task.CompletedTask);
+
+    _mockFileSystem
+      .Setup(x => x.Exists(s_simulatedTestModulePath))
+      .Returns(true);
+
+    _mockFileSystem
+      .Setup(x => x.Exists(s_simulatedTestModuleDirectory))
+      .Returns(true);
+
+    _mockFileSystem
+      .Setup(x => x.Exists(s_simulatedReportDirectory))
+      .Returns(true);
+  }
+
+  private static CoverageResult CreateTestCoverageResult()
+  {
+    var lines = new Lines { { 1, 1 }, { 2, 1 } };
+    var branches = new Branches
+    {
+      new BranchInfo { Line = 1, Hits = 1, Offset = 0, EndOffset = 10, Path = 0, Ordinal = 1 }
+    };
+
+    var methods = new Methods();
+    string methodName = "System.Void TestClass::TestMethod()";
+    methods.Add(methodName, new Method
+    {
+      Lines = lines,
+      Branches = branches
+    });
+
+    var classes = new Classes { { "TestNamespace.TestClass", methods } };
+    var documents = new Documents { { "TestFile.cs", classes } };
+    var modules = new Modules { { s_simulatedTestModulePath, documents } };
+
+    return new CoverageResult
+    {
+      Identifier = "test-id",
+      Modules = modules,
+      Parameters = new CoverageParameters()
+    };
+  }
+
+  private CollectorExtension CreateCollectorWithCoverageEnabled()
+  {
+    _mockCommandLineOptions
+      .Setup(x => x.IsOptionSet(CoverletOptionNames.Coverage))
+      .Returns(true);
+
+    _mockConfiguration
+      .Setup(x => x["TestModule"])
+      .Returns(s_simulatedTestModulePath);
+
+    _mockConfiguration
+      .Setup(x => x["TestResultDirectory"])
+      .Returns(s_simulatedReportDirectory);
+
+    return new CollectorExtension(
+      _mockLoggerFactory.Object,
+      _mockCommandLineOptions.Object,
+      _mockOutputDevice.Object,
+      _mockConfiguration.Object,
+      _mockFileSystem.Object,
+      messageBus: _mockMessageBus.Object);
+  }
+
+  #region GenerateCoverageReportFiles Tests
+
+  [Fact]
+  public void GenerateCoverageReportFilesWithJsonFormatWritesJsonFile()
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+    var result = CreateTestCoverageResult();
+    string[] formats = ["json"];
+    string expectedReportPath = Path.Combine(s_simulatedReportDirectory, "coverage.json");
+
+    var mockReporter = new Mock<IReporter>();
+    mockReporter.Setup(x => x.OutputType).Returns(ReporterOutputType.File);
+    mockReporter.Setup(x => x.Extension).Returns("json");
+    mockReporter.Setup(x => x.Report(result, _mockSourceRootTranslator.Object))
+      .Returns("{\"coverage\":\"data\"}");
+
+    var mockReporterFactory = new Mock<IReporterFactory>();
+    mockReporterFactory.Setup(x => x.CreateReporter("json"))
+      .Returns(mockReporter.Object);
+
+    collector.ReporterFactoryOverride = mockReporterFactory.Object;
+
+    // Act
+    (List<string> generatedReports, List<string> consoleOutputs) = collector.GenerateCoverageReportFiles(
+      result,
+      _mockSourceRootTranslator.Object,
+      _mockFileSystem.Object,
+      s_simulatedReportDirectory,
+      formats);
+
+    // Assert
+    Assert.Single(generatedReports);
+    Assert.Equal(expectedReportPath, RemoveTimestamp(generatedReports[0]));
+    _mockFileSystem.Verify(
+      x => x.WriteAllText(generatedReports[0], "{\"coverage\":\"data\"}"),
+      Times.Once);
+  }
+
+  [Fact]
+  public void GenerateCoverageReportFilesWithMultipleFormatsWritesMultipleFiles()
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+    var result = CreateTestCoverageResult();
+    string[] formats = ["json", "lcov", "cobertura"];
+
+    var mockJsonReporter = new Mock<IReporter>();
+    mockJsonReporter.Setup(x => x.OutputType).Returns(ReporterOutputType.File);
+    mockJsonReporter.Setup(x => x.Extension).Returns("json");
+    mockJsonReporter.Setup(x => x.Report(result, _mockSourceRootTranslator.Object))
+      .Returns("{\"json\":\"data\"}");
+
+    var mockLcovReporter = new Mock<IReporter>();
+    mockLcovReporter.Setup(x => x.OutputType).Returns(ReporterOutputType.File);
+    mockLcovReporter.Setup(x => x.Extension).Returns("info");
+    mockLcovReporter.Setup(x => x.Report(result, _mockSourceRootTranslator.Object))
+      .Returns("lcov data");
+
+    var mockCoberturaReporter = new Mock<IReporter>();
+    mockCoberturaReporter.Setup(x => x.OutputType).Returns(ReporterOutputType.File);
+    mockCoberturaReporter.Setup(x => x.Extension).Returns("xml");
+    mockCoberturaReporter.Setup(x => x.Report(result, _mockSourceRootTranslator.Object))
+      .Returns("<coverage/>");
+
+    var mockReporterFactory = new Mock<IReporterFactory>();
+    mockReporterFactory.Setup(x => x.CreateReporter("json")).Returns(mockJsonReporter.Object);
+    mockReporterFactory.Setup(x => x.CreateReporter("lcov")).Returns(mockLcovReporter.Object);
+    mockReporterFactory.Setup(x => x.CreateReporter("cobertura")).Returns(mockCoberturaReporter.Object);
+
+    collector.ReporterFactoryOverride = mockReporterFactory.Object;
+
+    // Act
+    (List<string> generatedReports, List<string> consoleOutputs) = collector.GenerateCoverageReportFiles(
+      result,
+      _mockSourceRootTranslator.Object,
+      _mockFileSystem.Object,
+      s_simulatedReportDirectory,
+      formats);
+
+    // Assert
+    Assert.Equal(3, generatedReports.Count);
+    //update list and remove timestamp from names before assertion since timestamp is generated at runtime and cannot be predicted in test
+    var normalizedReports = generatedReports.Select(RemoveTimestamp).ToList();
+    Assert.Contains(Path.Combine(s_simulatedReportDirectory, "coverage.json"), normalizedReports);
+    Assert.Contains(Path.Combine(s_simulatedReportDirectory, "coverage.info"), normalizedReports);
+    Assert.Contains(Path.Combine(s_simulatedReportDirectory, "coverage.xml"), normalizedReports);
+
+    _mockFileSystem.Verify(x => x.WriteAllText(It.IsAny<string>(), It.IsAny<string>()), Times.Exactly(3));
+  }
+
+  [Fact]
+  public void GenerateCoverageReportFilesWithConsoleFormatDoesNotWriteFile()
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+    var result = CreateTestCoverageResult();
+    string[] formats = ["teamcity"];
+
+    var mockReporter = new Mock<IReporter>();
+    mockReporter.Setup(x => x.OutputType).Returns(ReporterOutputType.Console);
+    mockReporter.Setup(x => x.Report(result, _mockSourceRootTranslator.Object))
+      .Returns("Console output");
+
+    var mockReporterFactory = new Mock<IReporterFactory>();
+    mockReporterFactory.Setup(x => x.CreateReporter("teamcity"))
+      .Returns(mockReporter.Object);
+
+    collector.ReporterFactoryOverride = mockReporterFactory.Object;
+
+    // Act
+    (List<string> generatedReports, List<string> consoleOutputs) = collector.GenerateCoverageReportFiles(
+      result,
+      _mockSourceRootTranslator.Object,
+      _mockFileSystem.Object,
+      s_simulatedReportDirectory,
+      formats);
+
+    // Assert
+    Assert.Empty(generatedReports);
+    _mockFileSystem.Verify(x => x.WriteAllText(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
+    Assert.Single(consoleOutputs);
+    Assert.Equal("Console output", consoleOutputs[0]);
+  }
+
+  [Fact]
+  public void GenerateCoverageReportFilesWithMixedFormatTypesWritesOnlyFileReports()
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+    var result = CreateTestCoverageResult();
+    string[] formats = ["json", "teamcity"];
+
+    var mockJsonReporter = new Mock<IReporter>();
+    mockJsonReporter.Setup(x => x.OutputType).Returns(ReporterOutputType.File);
+    mockJsonReporter.Setup(x => x.Extension).Returns("json");
+    mockJsonReporter.Setup(x => x.Report(result, _mockSourceRootTranslator.Object))
+      .Returns("{\"json\":\"data\"}");
+
+    var mockTeamCityReporter = new Mock<IReporter>();
+    mockTeamCityReporter.Setup(x => x.OutputType).Returns(ReporterOutputType.Console);
+    mockTeamCityReporter.Setup(x => x.Report(result, _mockSourceRootTranslator.Object))
+      .Returns("Console output");
+
+    var mockReporterFactory = new Mock<IReporterFactory>();
+    mockReporterFactory.Setup(x => x.CreateReporter("json")).Returns(mockJsonReporter.Object);
+    mockReporterFactory.Setup(x => x.CreateReporter("teamcity")).Returns(mockTeamCityReporter.Object);
+
+    collector.ReporterFactoryOverride = mockReporterFactory.Object;
+
+    // Act
+    (List<string> generatedReports, List<string> consoleOutputs) = collector.GenerateCoverageReportFiles(
+      result,
+      _mockSourceRootTranslator.Object,
+      _mockFileSystem.Object,
+      s_simulatedReportDirectory,
+      formats);
+
+    // Assert
+    Assert.Single(generatedReports);
+    _mockFileSystem.Verify(x => x.WriteAllText(It.IsAny<string>(), It.IsAny<string>()), Times.Once);
+    Assert.Single(consoleOutputs);
+    Assert.Equal("Console output", consoleOutputs[0]);
+  }
+
+  [Fact]
+  public void GenerateCoverageReportFilesWithInvalidFormatThrowsInvalidOperationException()
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+    var result = CreateTestCoverageResult();
+    string[] formats = ["invalid-format"];
+
+    var mockReporterFactory = new Mock<IReporterFactory>();
+    mockReporterFactory.Setup(x => x.CreateReporter("invalid-format"))
+      .Returns((IReporter?)null);
+
+    collector.ReporterFactoryOverride = mockReporterFactory.Object;
+
+    // Act & Assert
+    InvalidOperationException ex = Assert.Throws<InvalidOperationException>(() =>
+      collector.GenerateCoverageReportFiles(
+        result,
+        _mockSourceRootTranslator.Object,
+        _mockFileSystem.Object,
+        s_simulatedReportDirectory,
+        formats));
+
+    Assert.Contains("invalid-format", ex.Message);
+    Assert.Contains("not supported", ex.Message);
+  }
+
+  [Fact]
+  public void GenerateCoverageReportFilesWithEmptyFormatsArrayReturnsEmptyList()
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+    var result = CreateTestCoverageResult();
+    string[] formats = [];
+
+    // Act
+    (List<string> generatedReports, List<string> consoleOutputs) = collector.GenerateCoverageReportFiles(
+      result,
+      _mockSourceRootTranslator.Object,
+      _mockFileSystem.Object,
+      s_simulatedReportDirectory,
+      formats);
+
+    // Assert
+    Assert.Empty(generatedReports);
+    Assert.Empty(consoleOutputs);
+    _mockFileSystem.Verify(x => x.WriteAllText(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
+  }
+
+  #endregion
+
+  #region DisplayGeneratedReportsAsync Tests
+
+  [Fact]
+  public async Task DisplayGeneratedReportsAsyncWithEmptyListDoesNotCallOutputDevice()
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+    var emptyReports = new List<string>();
+
+    // Use reflection to call private method
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("DisplayGeneratedReportsAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+    Assert.NotNull(method);
+
+    // Act
+    await (Task)method.Invoke(collector, [emptyReports, CancellationToken.None])!;
+
+    // Assert
+    _mockOutputDevice.Verify(
+      x => x.DisplayAsync(It.IsAny<IOutputDeviceDataProducer>(), It.IsAny<IOutputDeviceData>(), It.IsAny<CancellationToken>()),
+      Times.Never);
+  }
+
+  [Fact]
+  public async Task DisplayGeneratedReportsAsyncWithSingleReportCallsOutputDevice()
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+    var reports = new List<string> { CreatePlatformPath("fake", "reports", "coverage.json") };
+
+    _mockOutputDevice.Setup(x => x.DisplayAsync(
+      It.IsAny<IOutputDeviceDataProducer>(),
+      It.IsAny<IOutputDeviceData>(),
+      It.IsAny<CancellationToken>()))
+      .Returns(Task.CompletedTask);
+
+    // Use reflection to call private method
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("DisplayGeneratedReportsAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+    Assert.NotNull(method);
+
+    // Act
+    await (Task)method.Invoke(collector, [reports, CancellationToken.None])!;
+
+    // Assert
+    _mockOutputDevice.Verify(
+      x => x.DisplayAsync(
+        It.Is<IOutputDeviceDataProducer>(p => p == collector),
+        It.Is<IOutputDeviceData>(data => data is TextOutputDeviceData),
+        It.IsAny<CancellationToken>()),
+      Times.Once);
+  }
+
+  [Fact]
+  public async Task DisplayGeneratedReportsAsyncWithMultipleReportsCallsOutputDevice()
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+    var reports = new List<string>
+    {
+      CreatePlatformPath("fake", "reports", "coverage.json"),
+      CreatePlatformPath("fake", "reports", "coverage.xml"),
+      CreatePlatformPath("fake", "reports", "coverage.info")
+    };
+
+    _mockOutputDevice.Setup(x => x.DisplayAsync(
+      It.IsAny<IOutputDeviceDataProducer>(),
+      It.IsAny<IOutputDeviceData>(),
+      It.IsAny<CancellationToken>()))
+      .Returns(Task.CompletedTask);
+
+    // Use reflection to call private method
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("DisplayGeneratedReportsAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+    Assert.NotNull(method);
+
+    // Act
+    await (Task)method.Invoke(collector, [reports, CancellationToken.None])!;
+
+    // Assert
+    _mockOutputDevice.Verify(
+      x => x.DisplayAsync(
+        It.IsAny<IOutputDeviceDataProducer>(),
+        It.IsAny<IOutputDeviceData>(),
+        It.IsAny<CancellationToken>()),
+      Times.Once);
+  }
+
+  [Fact]
+  public async Task DisplayGeneratedReportsAsyncRespectsCancellationToken()
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+    var reports = new List<string> { CreatePlatformPath("fake", "reports", "coverage.json") };
+    using var cts = new CancellationTokenSource();
+    CancellationToken token = cts.Token;
+
+    _mockOutputDevice.Setup(x => x.DisplayAsync(
+      It.IsAny<IOutputDeviceDataProducer>(),
+      It.IsAny<IOutputDeviceData>(),
+      token))
+      .Returns(Task.CompletedTask);
+
+    // Use reflection to call private method
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("DisplayGeneratedReportsAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+    Assert.NotNull(method);
+
+    // Act
+    await (Task)method.Invoke(collector, [reports, token])!;
+
+    // Assert
+    _mockOutputDevice.Verify(
+      x => x.DisplayAsync(
+        It.IsAny<IOutputDeviceDataProducer>(),
+        It.IsAny<IOutputDeviceData>(),
+        token),
+      Times.Once);
+  }
+
+  #endregion
+
+  #region DisplayConsoleReportOutputsAsync Tests
+
+  [Fact]
+  public async Task DisplayConsoleReportOutputsAsyncWithEmptyListDoesNotCallOutputDevice()
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+    var consoleOutputs = new List<string>();
+
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("DisplayConsoleReportOutputsAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+    Assert.NotNull(method);
+
+    // Act
+    await (Task)method.Invoke(collector, [consoleOutputs, CancellationToken.None])!;
+
+    // Assert
+    _mockOutputDevice.Verify(
+      x => x.DisplayAsync(It.IsAny<IOutputDeviceDataProducer>(), It.IsAny<IOutputDeviceData>(), It.IsAny<CancellationToken>()),
+      Times.Never);
+  }
+
+  [Fact]
+  public async Task DisplayConsoleReportOutputsAsyncWithMultipleOutputsCallsOutputDeviceForEachOutput()
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+    var consoleOutputs = new List<string> { "##teamcity[buildStatus status='SUCCESS']", "console-report-line" };
+
+    _mockOutputDevice.Setup(x => x.DisplayAsync(
+      It.IsAny<IOutputDeviceDataProducer>(),
+      It.IsAny<IOutputDeviceData>(),
+      It.IsAny<CancellationToken>()))
+      .Returns(Task.CompletedTask);
+
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("DisplayConsoleReportOutputsAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+    Assert.NotNull(method);
+
+    // Act
+    await (Task)method.Invoke(collector, [consoleOutputs, CancellationToken.None])!;
+
+    // Assert
+    _mockOutputDevice.Verify(
+      x => x.DisplayAsync(
+        It.Is<IOutputDeviceDataProducer>(p => p == collector),
+        It.Is<TextOutputDeviceData>(data => data.Text.Contains("teamcity") || data.Text.Contains("console-report-line")),
+        It.IsAny<CancellationToken>()),
+      Times.Exactly(2));
+  }
+
+  #endregion
+
+  #region PublishCoverageDataAsync Tests
+
+  [Fact]
+  public async Task PublishCoverageDataAsyncPublishesCoverageMessages()
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+    CoverageResult result = CreateTestCoverageResult();
+
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("PublishCoverageDataAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+    Assert.NotNull(method);
+
+    // Act
+    await (Task)method.Invoke(collector, [result, new List<string>(), CancellationToken.None])!;
+
+    // Assert
+    _mockMessageBus.Verify(
+      x => x.PublishAsync(
+        It.IsAny<IDataProducer>(),
+        It.Is<IData>(data => data is TestCoverageMessage
+          && ((TestCoverageMessage)data).Scope.Level == CoverageScopeLevel.Overall
+          && ((TestCoverageMessage)data).Metric == CoverageMetric.Line)),
+      Times.Once);
+  }
+
+  #endregion
+
+  #region GetHitsFilePath Tests
+
+  [Fact]
+  public void GetHitsFilePathReturnsDirectoryOfTestModule()
+  {
+    // Arrange
+    _mockCommandLineOptions
+      .Setup(x => x.IsOptionSet(CoverletOptionNames.Coverage))
+      .Returns(true);
+
+    _mockConfiguration
+      .Setup(x => x["TestModule"])
+      .Returns(s_simulatedTestModulePath);
+
+    var collector = new CollectorExtension(
+      _mockLoggerFactory.Object,
+      _mockCommandLineOptions.Object,
+      _mockOutputDevice.Object,
+      _mockConfiguration.Object,
+      _mockFileSystem.Object);
+
+    // Use reflection to access private field _testModulePath
+    System.Reflection.FieldInfo? field = typeof(CollectorExtension)
+      .GetField("_testModulePath", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+    Assert.NotNull(field);
+    field.SetValue(collector, s_simulatedTestModulePath);
+
+    // Use reflection to call private method GetHitsFilePath
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("GetHitsFilePath", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+    Assert.NotNull(method);
+
+    // Act
+    string? hitsPath = (string?)method.Invoke(collector, null);
+
+    // Assert
+    Assert.NotNull(hitsPath);
+    Assert.Equal(s_simulatedTestModuleDirectory, hitsPath);
+  }
+
+  [Fact]
+  public void GetHitsFilePathWithNullTestModulePathReturnsEmpty()
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+
+    // Use reflection to access private field _testModulePath and set it to null
+    System.Reflection.FieldInfo? field = typeof(CollectorExtension)
+      .GetField("_testModulePath", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+    Assert.NotNull(field);
+    field.SetValue(collector, null);
+
+    // Use reflection to call private method GetHitsFilePath
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("GetHitsFilePath", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+    Assert.NotNull(method);
+
+    // Act
+    string? hitsPath = (string?)method.Invoke(collector, null);
+
+    // Assert
+    Assert.NotNull(hitsPath);
+    Assert.Equal(string.Empty, hitsPath);
+  }
+
+  [Fact]
+  public void GetHitsFilePathWithEmptyTestModulePathReturnsEmpty()
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+
+    // Use reflection to access private field _testModulePath and set it to empty
+    System.Reflection.FieldInfo? field = typeof(CollectorExtension)
+      .GetField("_testModulePath", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+    Assert.NotNull(field);
+    field.SetValue(collector, string.Empty);
+
+    // Use reflection to call private method GetHitsFilePath
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("GetHitsFilePath", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+    Assert.NotNull(method);
+
+    // Act
+    string? hitsPath = (string?)method.Invoke(collector, null);
+
+    // Assert
+    Assert.NotNull(hitsPath);
+    Assert.Equal(string.Empty, hitsPath);
+  }
+
+  [Theory]
+  [MemberData(nameof(GetPathTestData))]
+  public void GetHitsFilePathReturnsCorrectDirectoryForVariousPaths(string modulePath, string expectedDirectory)
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+
+    // Use reflection to access private field _testModulePath
+    System.Reflection.FieldInfo? field = typeof(CollectorExtension)
+      .GetField("_testModulePath", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+    Assert.NotNull(field);
+    field.SetValue(collector, modulePath);
+
+    // Use reflection to call private method GetHitsFilePath
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("GetHitsFilePath", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+    Assert.NotNull(method);
+
+    // Act
+    string? hitsPath = (string?)method.Invoke(collector, null);
+
+    // Assert
+    Assert.NotNull(hitsPath);
+    Assert.Equal(expectedDirectory, hitsPath);
+  }
+
+  /// <summary>
+  /// Provides platform-specific test data for path testing.
+  /// This ensures tests work correctly on Windows, Linux, and macOS.
+  /// </summary>
+  public static TheoryData<string, string> GetPathTestData()
+  {
+    return new TheoryData<string, string>
+    {
+      {
+        CreatePlatformPath("fake", "path", "to", "assembly", "test.dll"),
+        CreatePlatformPath("fake", "path", "to", "assembly")
+      },
+      {
+        CreatePlatformPath("another", "directory", "mytest.dll"),
+        CreatePlatformPath("another", "directory")
+      },
+      {
+        CreatePlatformPath("deeply", "nested", "folder", "structure", "test.dll"),
+        CreatePlatformPath("deeply", "nested", "folder", "structure")
+      }
+    };
+  }
+
+  #endregion
+
+  #region Configuration Loading Tests
+
+  [Fact]
+  public void LoadTestConfigSettingsWhenAppSpecificConfigExistsReturnsSettings()
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+    string testModulePath = CreatePlatformPath("fake", "path", "test.dll");
+    string configPath = CreatePlatformPath("fake", "path", "test.testconfig.json");
+
+    _mockFileSystem.Setup(x => x.Exists(configPath)).Returns(true);
+    _mockFileSystem.Setup(x => x.ReadAllText(configPath)).Returns(
+      """
+      {
+        "platformOptions": {
+          "coverlet": {
+            "format": "json",
+            "includeDirectory": "/config/include"
+          }
+        }
+      }
+      """);
+
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("LoadTestConfigSettings", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+    Assert.NotNull(method);
+
+    // Act
+    var settings = (Coverlet.MTP.Configuration.CoverletMTPSettings?)method.Invoke(collector, [testModulePath]);
+
+    // Assert
+    Assert.NotNull(settings);
+    Assert.True(settings.IsFromConfigFile);
+    Assert.Contains("json", settings.ReportFormats);
+    Assert.Contains("/config/include", settings.IncludeDirectories);
+  }
+
+  [Fact]
+  public void LoadLegacyAppSettingsWhenConfigFileExistsReturnsSettingsWithConfigFlag()
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+    string testModulePath = CreatePlatformPath("fake", "path", "test.dll");
+    string configPath = Path.Combine(CreatePlatformPath("fake", "path"), "coverlet.mtp.appsettings.json");
+
+    _mockFileSystem.Setup(x => x.Exists(configPath)).Returns(true);
+    _mockFileSystem.Setup(x => x.ReadAllText(configPath)).Returns(
+      """
+      {
+        "Coverlet": {
+          "Format": "json",
+          "IncludeDirectory": "/legacy/include",
+          "ExcludeByFile": "**/LegacyGenerated/**"
+        }
+      }
+      """);
+
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("LoadLegacyAppSettings", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+    Assert.NotNull(method);
+
+    // Act
+    var settings = (Coverlet.MTP.Configuration.CoverletMTPSettings?)method.Invoke(collector, [testModulePath]);
+
+    // Assert
+    Assert.NotNull(settings);
+    Assert.True(settings.IsFromConfigFile);
+    Assert.Contains("json", settings.ReportFormats);
+    Assert.Contains("/legacy/include", settings.IncludeDirectories);
+    Assert.Contains("**/LegacyGenerated/**", settings.ExcludeSourceFiles);
+  }
+
+  #endregion
+
+  #region DisplayErrorToUserAsync Tests
+
+  [Fact]
+  public async Task DisplayErrorToUserAsyncDisplaysFormattedErrorMessage()
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+    var testException = new InvalidOperationException("Test error message");
+
+    _mockOutputDevice.Setup(x => x.DisplayAsync(
+      It.IsAny<IOutputDeviceDataProducer>(),
+      It.IsAny<IOutputDeviceData>(),
+      It.IsAny<CancellationToken>()))
+      .Returns(Task.CompletedTask);
+
+    // Use reflection to call private method
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("DisplayErrorToUserAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+    Assert.NotNull(method);
+
+    // Act
+    await (Task)method.Invoke(collector, [testException])!;
+
+    // Assert - should display 3 messages: error header (red), error message (yellow), and diagnostic hint
+    _mockOutputDevice.Verify(
+      x => x.DisplayAsync(
+        It.Is<IOutputDeviceDataProducer>(p => p == collector),
+        It.Is<FormattedTextOutputDeviceData>(data => data.Text.Contains("Coverage instrumentation failed")),
+        It.IsAny<CancellationToken>()),
+      Times.Once);
+
+    _mockOutputDevice.Verify(
+      x => x.DisplayAsync(
+        It.Is<IOutputDeviceDataProducer>(p => p == collector),
+        It.Is<FormattedTextOutputDeviceData>(data => data.Text.Contains("Test error message")),
+        It.IsAny<CancellationToken>()),
+      Times.Once);
+
+    _mockOutputDevice.Verify(
+      x => x.DisplayAsync(
+        It.Is<IOutputDeviceDataProducer>(p => p == collector),
+        It.Is<TextOutputDeviceData>(data => data.Text.Contains("--diagnostic")),
+        It.IsAny<CancellationToken>()),
+      Times.Once);
+  }
+
+  [Fact]
+  public async Task DisplayErrorToUserAsyncHandlesIOException()
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+    var testException = new IOException("The file is in use by another process");
+
+    _mockOutputDevice.Setup(x => x.DisplayAsync(
+      It.IsAny<IOutputDeviceDataProducer>(),
+      It.IsAny<IOutputDeviceData>(),
+      It.IsAny<CancellationToken>()))
+      .Returns(Task.CompletedTask);
+
+    // Use reflection to call private method
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("DisplayErrorToUserAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+    Assert.NotNull(method);
+
+    // Act
+    await (Task)method.Invoke(collector, [testException])!;
+
+    // Assert - verify the IOException message is displayed
+    _mockOutputDevice.Verify(
+      x => x.DisplayAsync(
+        It.Is<IOutputDeviceDataProducer>(p => p == collector),
+        It.Is<FormattedTextOutputDeviceData>(data => data.Text.Contains("file is in use")),
+        It.IsAny<CancellationToken>()),
+      Times.Once);
+  }
+
+  [Fact]
+  public async Task DisplayErrorToUserAsyncHandlesAggregateException()
+  {
+    // Arrange
+    var collector = CreateCollectorWithCoverageEnabled();
+    var aggException = new AggregateException(
+      new InvalidOperationException("First error"),
+      new IOException("Second error"));
+
+    _mockOutputDevice.Setup(x => x.DisplayAsync(
+      It.IsAny<IOutputDeviceDataProducer>(),
+      It.IsAny<IOutputDeviceData>(),
+      It.IsAny<CancellationToken>()))
+      .Returns(Task.CompletedTask);
+
+    // Use reflection to call private method
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("DisplayErrorToUserAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+    Assert.NotNull(method);
+
+    // Act
+    await (Task)method.Invoke(collector, [aggException])!;
+
+    // Assert - should display both inner exception messages
+    _mockOutputDevice.Verify(
+      x => x.DisplayAsync(
+        It.Is<IOutputDeviceDataProducer>(p => p == collector),
+        It.Is<FormattedTextOutputDeviceData>(data => data.Text.Contains("First error")),
+        It.IsAny<CancellationToken>()),
+      Times.Once);
+  }
+
+  #endregion
+
+  #region FormatErrorForDisplay Tests
+
+  [Fact]
+  public void FormatErrorForDisplayReturnsMessageForSimpleException()
+  {
+    // Arrange - use reflection to call private static method
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("FormatErrorForDisplay", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+    Assert.NotNull(method);
+
+    var testException = new InvalidOperationException("Simple error message");
+
+    // Act
+    string? result = (string?)method.Invoke(null, [testException]);
+
+    // Assert
+    Assert.NotNull(result);
+    Assert.Equal("Simple error message", result);
+  }
+
+  [Fact]
+  public void FormatErrorForDisplayExtractsDistinctMessagesFromAggregateException()
+  {
+    // Arrange
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("FormatErrorForDisplay", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+    Assert.NotNull(method);
+
+    var aggException = new AggregateException(
+      new InvalidOperationException("Error A"),
+      new InvalidOperationException("Error B"),
+      new InvalidOperationException("Error A")); // Duplicate
+
+    // Act
+    string? result = (string?)method.Invoke(null, [aggException]);
+
+    // Assert
+    Assert.NotNull(result);
+    Assert.Contains("Error A", result);
+    Assert.Contains("Error B", result);
+    // Duplicate "Error A" should be filtered out (Distinct)
+    int countA = result.Split(["Error A"], StringSplitOptions.None).Length - 1;
+    Assert.Equal(1, countA);
+  }
+
+  [Fact]
+  public void FormatErrorForDisplayHandlesEmptyAggregateException()
+  {
+    // Arrange
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("FormatErrorForDisplay", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+    Assert.NotNull(method);
+
+    // Create AggregateException with empty inner exceptions via reflection
+    // Note: Normally AggregateException requires at least one inner exception,
+    // but the code handles InnerExceptions.Count > 0 check
+    var aggException = new AggregateException("Aggregate error with no inner");
+
+    // Act
+    string? result = (string?)method.Invoke(null, [aggException]);
+
+    // Assert - when no inner exceptions, it should return the aggregate message
+    Assert.NotNull(result);
+  }
+
+  #endregion
+
+  #region GetConciseErrorMessage Tests
+
+  [Fact]
+  public void GetConciseErrorMessageReturnsMessageForGenericException()
+  {
+    // Arrange
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("GetConciseErrorMessage", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+    Assert.NotNull(method);
+
+    var testException = new InvalidOperationException("Generic error occurred");
+
+    // Act
+    string? result = (string?)method.Invoke(null, [testException]);
+
+    // Assert
+    Assert.NotNull(result);
+    Assert.Equal("Generic error occurred", result);
+  }
+
+  [Fact]
+  public void GetConciseErrorMessageReturnsMessageForIOException()
+  {
+    // Arrange
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("GetConciseErrorMessage", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+    Assert.NotNull(method);
+
+    var ioException = new IOException("File not found: test.dll");
+
+    // Act
+    string? result = (string?)method.Invoke(null, [ioException]);
+
+    // Assert
+    Assert.NotNull(result);
+    Assert.Equal("File not found: test.dll", result);
+  }
+
+  [Fact]
+  public void GetConciseErrorMessageReturnsMessageForFileNotFoundException()
+  {
+    // Arrange
+    System.Reflection.MethodInfo? method = typeof(CollectorExtension)
+      .GetMethod("GetConciseErrorMessage", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+    Assert.NotNull(method);
+
+    // FileNotFoundException is a subclass of IOException
+    var fileNotFound = new FileNotFoundException("Could not find file", "assembly.dll");
+
+    // Act
+    string? result = (string?)method.Invoke(null, [fileNotFound]);
+
+    // Assert
+    Assert.NotNull(result);
+    Assert.Contains("Could not find file", result);
+  }
+
+  private static string RemoveTimestamp(string filename)
+  {
+    // Matches a dot, 15 digits, and a dot (e.g., .280326084634246.)
+    return System.Text.RegularExpressions.Regex.Replace(filename, @"\.\d{15}\.", ".");
+  }
+  #endregion
+}
