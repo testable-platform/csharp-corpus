@@ -41,7 +41,7 @@ csc -langversion:7.3   ->  error CS8025: Feature 'async function' is not availab
 
 ## Supported tools
 
-5 of the 19 tools in the roster are expected to fire on this branch. The rest exit
+6 of the 19 tools in the roster are expected to fire on this branch. The rest exit
 3 (cannot run here) or 4 (absent from this host), each with its reason in both
 `run.sh` and `trigger.yaml`.
 
@@ -75,8 +75,7 @@ never ran" - so the source-level tools below are the built-in negative control:
 | MiniCover | skipped | MiniCover 3.10.0 declares .NET SDK 8.0/9.0/10.0 only -- verified against its own MiniCov |
 | Stryker.NET | skipped | Requires an SDK-style project and a modern SDK to run. Also: the sheet makes it primary  |
 | OpenTelemetry (.NET) + OTLP exporter | not-installed | STATUS CHANGED AT THIS FAMILY, for the same reason as Coverlet: netstandard2.0 clears at |
-| unilyze | absent | NOT A TOOL. The only package of this name anywhere is PyPI `unilyze` 0.2.1, 'Get detaile |
-
+| unilyze | active | Real tool (github.com/bigdra50/unilyze, MIT, v0.6.1) -- not absent. Verified: live cyclomatic/cognitive comp |
 ## Build
 
 ```bash
@@ -95,13 +94,24 @@ Restore will not succeed on a host where NuGet is unreachable; see `dataset.json
 19 tests are declared. They are **not** executed in this corpus's build, because no
 test framework can be restored.
 
+## Tool triggering data
+
+The tool folder is `Tool Triggering (Synthetic Data)` (renamed from `tools`). Every one of its 19 folders
+carries data that could trigger its tool, whether or not the tool can run on
+this family -- the product ships the tools and does the running, so the data
+has to be present either way. Each folder's `DATA.md` says what is planted in
+it and what a correct run should measure.
+
+No folder contains a project manifest. One there would make the platform treat
+the folder as a project of its own and run the whole roster against it.
+
 ## Tool entry points
 
 ```bash
-python3 tools/tool_integration.py            # banner
-python3 tools/tool_integration.py --verify   # every runner present and executable
-python3 tools/tool_integration.py --run      # run them all, compare to dataset.json
-python3 tools/full_check.py                  # cross-file consistency audit
+python3 "Tool Triggering (Synthetic Data)/tool_integration.py"            # banner
+python3 "Tool Triggering (Synthetic Data)/tool_integration.py" --verify   # every runner present and executable
+python3 "Tool Triggering (Synthetic Data)/tool_integration.py" --run      # run them all, compare to dataset.json
+python3 "Tool Triggering (Synthetic Data)/full_check.py"                  # cross-file consistency audit
 ```
 
 ## What is expected to fire
