@@ -1,0 +1,17 @@
+{
+  "note": "Not a manifest. The audit's real input is a project; this file records what a correct run should find: nothing.",
+  "targetFramework": "net9.0",
+  "expectedVulnerablePackages": 0,
+  "packages": [
+    {
+      "id": "Newtonsoft.Json",
+      "version": "13.0.3"
+    },
+    {
+      "id": "Serilog",
+      "version": "3.1.1"
+    }
+  ],
+  "advisoryCountsRecorded": false,
+  "whyNotRecorded": "Advisory data changes. Re-check live at evaluation time; a recalled 'no advisories' is only as good as the day it was recalled."
+}
