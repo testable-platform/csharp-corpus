@@ -1,0 +1,50 @@
+rules:
+  - id: hardcoded-secret
+    languages: [csharp]
+    severity: ERROR
+    message: Hardcoded secret or key material detected.
+    patterns:
+      - pattern-either:
+          - pattern: byte[] $KEY = { ... };
+          - pattern: string $KEY = "...";
+    metadata:
+      category: security
+
+  - id: weak-hash-algorithm
+    languages: [csharp]
+    severity: ERROR
+    message: Weak hash algorithm (MD5/SHA1) used for security-sensitive data.
+    patterns:
+      - pattern-either:
+          - pattern: MD5.Create(...)
+          - pattern: SHA1.Create(...)
+          - pattern: new MD5CryptoServiceProvider(...)
+          - pattern: new SHA1CryptoServiceProvider(...)
+    metadata:
+      category: security
+
+  - id: non-constant-time-compare
+    languages: [csharp]
+    severity: ERROR
+    message: Comparing secrets with == or .Equals is not constant-time.
+    patterns:
+      - pattern-either:
+          - pattern: $A == $B
+          - pattern: $A.Equals($B)
+      - metavariable-regex:
+          metavariable: $A
+          regex: (?i)^(seal|hmac|hash|token|secret)$
+      - metavariable-regex:
+          metavariable: $B
+          regex: (?i)^(seal|hmac|hash|token|secret)$
+    metadata:
+      category: security
+
+  - id: insecure-random
+    languages: [csharp]
+    severity: ERROR
+    message: System.Random is not cryptographically secure; use RandomNumberGenerator.
+    patterns:
+      - pattern: new Random(...)
+    metadata:
+      category: security
