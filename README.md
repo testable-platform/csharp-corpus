@@ -102,16 +102,30 @@ Restore will not succeed on a host where NuGet is unreachable; see `dataset.json
 19 tests are declared. They are **not** executed in this corpus's build, because no
 test framework can be restored.
 
-## Tool triggering data
+## Tool data folders
 
-The tool folder is `Tool Triggering (Synthetic Data)` (renamed from `tools`). Every one of its 19 folders
-carries data that could trigger its tool, whether or not the tool can run on
-this family -- the product ships the tools and does the running, so the data
-has to be present either way. Each folder's `DATA.md` says what is planted in
-it and what a correct run should measure.
+Four folders carry the per-tool data, the same four every language corpus in
+this programme uses. Their contents are byte-identical on every branch of this
+repository.
 
-No folder contains a project manifest. One there would make the platform treat
-the folder as a project of its own and run the whole roster against it.
+| Folder | What it holds |
+|---|---|
+| `Tool Triggering (Synthetic Data)` | 19 folders of planted data, one per runner, written to trigger its tool at this family's language version. Each folder's `DATA.md` says what is planted and what a correct run should measure. |
+| `Tool Clean (Synthetic Data)` | The 17 roster tools, with code a tool should find **nothing** in. The false-positive control. |
+| `Tool Invalid (Synthetic Data)` | The same 17 tools, with code a tool **should** flag. The true-positive control. |
+| `Tool Triggering (Tool Github Test data)` | Each tool's own upstream test suite, copied byte-for-byte from the tool's repository. `SOURCE.md` records the repo, commit and licence. |
+
+Clean and Invalid carry five version folders per tool -- `netfx45`, `netfx46`,
+`netcoreapp30`, `net9`, `net10`. Each compiles at its own C# level, and its
+`LanguageMarker` is rejected one level below, so the version a folder claims is
+verified by execution rather than asserted.
+
+**Clean, Invalid and Tool Triggering (Synthetic Data) contain no project
+manifest** -- no `.csproj`, `.sln`, `packages.config` or lockfile. One there
+would make the platform treat the folder as a project of its own and run the
+whole roster against it. `Tool Triggering (Tool Github Test data)` is the
+deliberate exception: it is upstream code kept exactly as upstream ships it,
+manifests included.
 
 ## Tool entry points
 
