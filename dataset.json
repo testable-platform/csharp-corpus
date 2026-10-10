@@ -1,5 +1,5 @@
 {
-  "branch": "CS-151",
+  "branch": "CS_VNETCOREAPP30_SDKMSBUILD_NUGETPACKAGESCONFIG_MONO",
   "family": "netcoreapp30",
   "targetFramework": "netcoreapp3.0",
   "netLabel": ".NET Core 3.0",
@@ -19,8 +19,10 @@
       "README.md": [
         "netstandard2.0"
       ],
-      "tools/roslyn-dataflow/README.md": [],
-      "tools/unilyze/README.md": []
+      "Tool Triggering (Synthetic Data)/roslyn-dataflow/README.md": [],
+      "Tool Triggering (Synthetic Data)/unilyze/README.md": [
+        "net45"
+      ]
     },
     "note": "README.md must be able to state OpenTelemetry's and Coverlet's own floors, which are netstandard2.0 -- a true sentence naming a foreign framework. The allowance is scoped to ONE file and ONE version so the blast radius is a single document. Widening the rule instead would silently un-catch the bug it was written for."
   },
@@ -31,7 +33,7 @@
     "note": "The domain layer is byte-identical across all 24 branches of this family, so any tool-output difference is attributable to the cell variables and nothing else."
   },
   "expectations": {
-    "toolsActive": 5,
+    "toolsActive": 6,
     "toolsTotal": 19,
     "metricsWithLivePrimary": 25,
     "metricsDark": 78,
@@ -197,10 +199,10 @@
     {
       "tool": "unilyze",
       "slug": "unilyze",
-      "kind": "absent",
-      "status": "absent",
-      "expectedExitCode": 3,
-      "reason": "NOT A TOOL. The only package of this name anywhere is PyPI `unilyze` 0.2.1, 'Get detailed unicode information about characters and text', last released 2020-07-23. Not on npm. It has no .NET surface of any kind. The source sheet assigns it as the alternative for 34 of the 103 metrics and declares '.NET 8-10, C# 8-14' for it, which is a fabricated capability claim. This runner exits 3 and says so, so the hole is visible rather than invisible."
+      "kind": "standalone",
+      "status": "active",
+      "expectedExitCode": 0,
+      "reason": "REPAIRED. unilyze is a real, actively maintained C# static analyzer (github.com/bigdra50/unilyze, MIT, v0.6.1) -- the \"not a tool\" finding was wrong. Whoever checked only searched PyPI (an unrelated Unicode-info package of the same name) and npm (404); the real tool is on NuGet (package `Unilyze`) and ships self-contained binaries on GitHub Releases, neither of which was checked. Verified by actually downloading and running v0.6.1 against this corpus's own domain code: it reports real per-method cyclomaticComplexity and cognitiveComplexity, and its peak findings match dataset.json's planted fixtures exactly (OrderKit.PricingService.PriceCents for cyclomatic, OrderKit.RiskScorer.Score for cognitive) on both this family and the net45 floor family. ``unilyze hotspot`` computes real git-churn x complexity via git log, a genuine alternative to pydriller for Code Churn. It is Class B -- its own Roslyn-based syntax walk needs no restore or build -- so the TFM is irrelevant to it, like Lizard/jscpd/Semgrep. Installed here from its GitHub Release binary, which this host's egress proxy does not block, unlike the NuGet-gated dotnet-tool channel every other analyzer here is stuck behind. It remains NOT a legitimate alternative for All Definition Coverage or All Uses Coverage (16 of the original 34 metrics): its own metric catalogue -- complexity, Halstead, cohesion, coupling, maintainability, churn -- has no def-use or data-flow analysis of any kind, so those 16 metrics are unaffected by this repair and stay exactly as broken as the roster defects doc already says -- see roslyn-dataflow."
     }
   ],
   "plantedFixtures": {
@@ -255,5 +257,40 @@
     "testsExecuted": false,
     "reason": "NuGet is refused at this host's egress proxy, so no PackageReference resolves and no test framework is available. Sources are verified by the Roslyn parse gate instead -- the replacement for the build gate, not a substitute for it.",
     "declaredTestCount": 19
+  },
+  "staleBranchIdBefore": "CS-151",
+  "toolData": {
+    "folder": "Tool Triggering (Synthetic Data)",
+    "renamedFrom": "tools",
+    "appliedBy": "Tool Triggering alignment 2026-10-08",
+    "rosterAuthority": "C_All_tools_List.xlsx (103 metric rows, 17 distinct tools)",
+    "toolFolders": 19,
+    "offRoster": {
+      "git-churn": "not in C_All_tools_List.xlsx; kept as a declared negative control, and named in expectations.negativeControl",
+      "roslyn-dataflow": "not in C_All_tools_List.xlsx; kept because the sheet assigns Data Flow to Stryker.NET, which computes no def-use chains"
+    },
+    "noSourceFixture": {
+      "pydriller": "input is the commit graph",
+      "git-churn": "input is the commit graph",
+      "trivy": "reads manifests, lockfiles and SBOMs, never C# source"
+    },
+    "noProjectManifest": true,
+    "whyNoProjectManifest": "A .csproj, .sln, packages.config or lockfile inside a tool folder makes the platform treat that folder as its own project and run the whole roster against it. 19 folders x 312 branches. The TypeScript corpus hit this: 203 of 276 tasks in a run were fixture overhead.",
+    "languageMarker": {
+      "languageVersion": "8.0",
+      "failsUnder": "7.3",
+      "gate": "csc -langversion:8.0 clean; -langversion:7.3 FAILS",
+      "note": "The C# core of every fixture is C# 5-compatible so it is identical across all 13 families; the LanguageMarker class is what pins each file to this family's version."
+    },
+    "semgrepRuleCorrection": {
+      "rule": "orderkit-tainted-query",
+      "was": "string.Format(\"SELECT $...ANY\", $...ARGS)",
+      "problem": "Semgrep does not interpolate metavariables inside a string literal, so the pattern required a string whose literal text is `SELECT $...ANY`. It matched nothing on any of the 312 branches, so the planted Flow 2 in InputSanitizer.BuildQuery was never measured. Nothing caught it because the runner grades on exit code and semgrep exits 0 at 4 findings or 5.",
+      "now": "the format string is captured and tested with a metavariable-regex",
+      "verifiedOn": [
+        "src/OrderKit/InputSanitizer.cs",
+        "Tool Triggering (Synthetic Data)/semgrep/TaintedFlows.cs"
+      ]
+    }
   }
 }
