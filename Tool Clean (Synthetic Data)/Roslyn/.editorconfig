@@ -1,0 +1,5 @@
+# Replaces Roslyn.csproj's analyzer settings (AnalysisLevel latest-all) without a project file.
+[*.cs]
+dotnet_analyzer_diagnostic.severity = warning
+dotnet_diagnostic.CA1848.severity = none
+dotnet_diagnostic.CA2007.severity = none
