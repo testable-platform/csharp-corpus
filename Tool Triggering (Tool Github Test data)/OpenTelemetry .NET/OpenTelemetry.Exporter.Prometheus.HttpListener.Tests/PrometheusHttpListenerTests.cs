@@ -1,0 +1,983 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Diagnostics.Metrics;
+using System.Globalization;
+using System.Net;
+#if NETFRAMEWORK
+using System.Net.Http;
+#endif
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Tests;
+
+namespace OpenTelemetry.Exporter.Prometheus.Tests;
+
+public class PrometheusHttpListenerTests
+{
+    private const string MeterVersion = "1.0.1";
+    private const string VerifyFileExtension = "txt";
+
+    private const string MeterName = nameof(PrometheusHttpListenerTests);
+
+    private static readonly ConcurrentDictionary<int, int> ConsumedPorts = [];
+
+    private static readonly TimeSpan DeadlineMargin = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan MaxCollectWait = TimeSpan.FromSeconds(30);
+
+    [Fact]
+    public async Task RunHttpServerWithDefaultOptions()
+    {
+        var output = await RunPrometheusExporterHttpServerIntegrationTest();
+
+        await Verify(output, VerifyFileExtension, PrometheusSerializerTests.VerifySettings);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RunHttpServerWithScopeInfoEnabledConfigured(bool scopeInfoEnabled)
+    {
+        var output = await RunPrometheusExporterHttpServerIntegrationTest(
+            configureListener: (options) =>
+            {
+                options.ScopeInfoEnabled = scopeInfoEnabled;
+                return options.Port;
+            },
+            assertResponseContent: false);
+
+        await Verify(output, VerifyFileExtension, PrometheusSerializerTests.VerifySettings).UseParameters(scopeInfoEnabled);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RunHttpServerWithTargetInfoEnabledConfigured(bool targetInfoEnabled)
+    {
+        var output = await RunPrometheusExporterHttpServerIntegrationTest(
+            configureListener: (options) =>
+            {
+                options.TargetInfoEnabled = targetInfoEnabled;
+                return options.Port;
+            },
+            assertResponseContent: false);
+
+        await Verify(output, VerifyFileExtension, PrometheusSerializerTests.VerifySettings).UseParameters(targetInfoEnabled);
+    }
+
+    [Theory]
+    [InlineData("all")]
+    [InlineData("service_name")]
+    [InlineData("none")]
+    public async Task RunHttpServerWithResourceConstantLabelsConfigured(string filter)
+    {
+        var output = await RunPrometheusExporterHttpServerIntegrationTest(
+            configureListener: (options) =>
+            {
+                options.ResourceConstantLabels = filter switch
+                {
+                    "all" => static _ => true,
+                    "service_name" => static key => key == "service.name",
+                    _ => static _ => false,
+                };
+                return options.Port;
+            },
+            assertResponseContent: false);
+
+        await Verify(output, VerifyFileExtension, PrometheusSerializerTests.VerifySettings).UseParameters(filter);
+    }
+
+    [Fact]
+    public async Task RunHttpServerWithNoMetrics()
+    {
+        var output = await RunPrometheusExporterHttpServerIntegrationTest(skipMetrics: true);
+
+        await Verify(output, VerifyFileExtension, PrometheusSerializerTests.VerifySettings);
+    }
+
+    [Fact]
+    public async Task RunHttpServerWithNoAcceptHeader()
+    {
+        var output = await RunPrometheusExporterHttpServerIntegrationTest(acceptHeader: string.Empty);
+
+        await Verify(output, VerifyFileExtension, PrometheusSerializerTests.VerifySettings);
+    }
+
+    [Fact]
+    public async Task RunHttpServerWithOpenMetricsVersionHeader()
+    {
+        var output = await RunPrometheusExporterHttpServerIntegrationTest(
+            acceptHeader: "application/openmetrics-text; version=1.0.0",
+            contentType: "application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=underscores");
+
+        await Verify(output, VerifyFileExtension, PrometheusSerializerTests.VerifySettings);
+    }
+
+    [Fact]
+    public async Task RunHttpServerWithNoAcceptHeaderAndMeterTags()
+    {
+        var tags = new KeyValuePair<string, object?>[]
+        {
+            new("meter1", "value1"),
+            new("meter2", "value2"),
+        };
+
+        var output = await RunPrometheusExporterHttpServerIntegrationTest(
+            acceptHeader: string.Empty,
+            meterTags: tags);
+
+        await Verify(output, VerifyFileExtension, PrometheusSerializerTests.VerifySettings);
+    }
+
+    [Fact]
+    public async Task RunHttpServerWithOpenMetricsVersionHeaderAndMeterTags()
+    {
+        var tags = new KeyValuePair<string, object?>[]
+        {
+            new("meter1", "value1"),
+            new("meter2", "value2"),
+        };
+
+        var output = await RunPrometheusExporterHttpServerIntegrationTest(
+            acceptHeader: "application/openmetrics-text; version=1.0.0",
+            contentType: "application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=underscores",
+            meterTags: tags);
+
+        await Verify(output, VerifyFileExtension, PrometheusSerializerTests.VerifySettings);
+    }
+
+    [Fact]
+    public void PrometheusHttpListenerThrowsOnStartIfPortAlreadyInUse()
+    {
+        // Step 1: Start a listener on a random port.
+        using var context = CreateListener(startToken: TestContext.Current.CancellationToken);
+
+        // Step 2: Try to start a second listener on the same port
+        using var exporter = new PrometheusExporter(new());
+        using var listener = new PrometheusHttpListener(
+            exporter,
+            new()
+            {
+                Host = "localhost",
+                Port = context.Port,
+            });
+
+        Assert.Throws<HttpListenerException>(() => listener.Start(TestContext.Current.CancellationToken));
+    }
+
+    [Theory]
+    [InlineData("application/openmetrics-text")]
+    [InlineData("")]
+    public async Task RunHttpServerBufferSizeIncreasesWithLargePayload(string acceptHeader)
+    {
+        using var meter = new Meter(MeterName, MeterVersion);
+
+        var attributes = new List<KeyValuePair<string, object>>();
+        var oneKb = new string('A', 1024);
+
+        for (var x = 0; x < 8_500; x++)
+        {
+            attributes.Add(new KeyValuePair<string, object>(x.ToString(CultureInfo.InvariantCulture), oneKb));
+        }
+
+        using var context = CreateMeterProvider(meter, attributes: attributes);
+
+        for (var x = 0; x < 1_000; x++)
+        {
+            var counter = meter.CreateCounter<double>("counter_double_" + x, unit: "By");
+            counter.Add(1);
+        }
+
+        context.Provider.ForceFlush();
+
+        using var client = new HttpClient
+        {
+            BaseAddress = context.BaseAddress,
+        };
+
+        if (!string.IsNullOrEmpty(acceptHeader))
+        {
+            client.DefaultRequestHeaders.Add("Accept", acceptHeader);
+        }
+
+        using var response = await client.GetAsync(new Uri("metrics", UriKind.Relative), TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+#if NET
+        var output = await response.Content.ReadAsStringAsync(TestContext.Current.CancellationToken);
+#else
+        var output = await response.Content.ReadAsStringAsync();
+#endif
+
+        Assert.Contains("counter_double_999", output, StringComparison.Ordinal);
+        Assert.DoesNotContain('\0', output);
+    }
+
+    [Fact]
+    public async Task PortOnly_Set_HostDefaultsToLocalhost()
+    {
+        using var meter = new Meter(MeterName, MeterVersion);
+
+        var port = GetRandomPort();
+
+        using var context = CreateMeterProvider(meter, configureListener: (options) =>
+        {
+            options.Port = port;
+            return port;
+        });
+
+        Assert.Equal("localhost", context.BaseAddress.Host);
+        Assert.Equal(port, context.Port);
+
+        using var client = new HttpClient { BaseAddress = context.BaseAddress };
+        using var response = await client.GetAsync(new Uri("metrics", UriKind.Relative), TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task HostOnly_Set_Port_DefaultsTo9464()
+    {
+#if NET
+        if (OperatingSystem.IsLinux())
+        {
+            // Linux does not like binding to 127.0.0.1 for some reason
+            return;
+        }
+#endif
+
+        using var meter = new Meter(MeterName, MeterVersion);
+
+        var host = "127.0.0.1";
+
+        using var context = CreateMeterProvider(meter, configureListener: (options) =>
+        {
+            options.Host = host;
+            return options.Port;
+        });
+
+        Assert.Equal(9464, context.Port);
+
+        using var client = new HttpClient { BaseAddress = context.BaseAddress };
+        using var response = await client.GetAsync(new Uri("metrics", UriKind.Relative), TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Fact]
+    public void Start_ThrowsObjectDisposedException_AfterDisposal()
+    {
+        using var exporter = new PrometheusExporter(new());
+        var listener = new PrometheusHttpListener(
+            exporter,
+            new()
+            {
+                Host = "localhost",
+                Port = GetRandomPort(),
+            });
+
+        listener.Dispose();
+
+        Assert.Throws<ObjectDisposedException>(() => listener.Start(TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task ProcessRequest_Returns503_AfterDisposal()
+    {
+        EnsureThreadPoolWorkerThreadsAvailable();
+
+        using var meter = new Meter(MeterName, MeterVersion);
+
+        var port = GetRandomPort();
+
+        using var provider = Sdk.CreateMeterProviderBuilder()
+            .AddMeter(meter.Name)
+            .AddPrometheusHttpListener(options =>
+            {
+                options.Host = "localhost";
+                options.Port = port;
+            })
+            .Build();
+
+#pragma warning disable CA2000 // Dispose objects before losing scope
+        if (!provider.TryFindExporter(out PrometheusExporter? exporter))
+#pragma warning restore CA2000 // Dispose objects before losing scope
+        {
+            throw new InvalidOperationException("PrometheusExporter could not be found on MeterProvider.");
+        }
+
+        // Create a counter and record a value so that collection has something to export.
+        var counter = meter.CreateCounter<int>("test_counter");
+        counter.Add(1);
+
+        // Replace the Collect delegate with one that blocks until we release it.
+        // This lets us hold a request inside ProcessRequestAsync (in EnterCollect)
+        // while we trigger disposal.
+        using var collectBlocker = new ManualResetEventSlim(false);
+        using var collectEntered = new ManualResetEventSlim(false);
+        var originalCollect = exporter.Collect;
+        exporter.Collect = (timeout) =>
+        {
+            collectEntered.Set();
+            collectBlocker.Wait(TimeSpan.FromSeconds(10));
+            return originalCollect!(timeout);
+        };
+
+        var baseAddress = new UriBuilder(Uri.UriSchemeHttp, "localhost", port).Uri;
+        using var client = new HttpClient { BaseAddress = baseAddress };
+
+        // Send a scrape request; it will block inside the collection.
+        var scrapeTask = client.GetAsync(
+            new Uri("metrics", UriKind.Relative),
+            HttpCompletionOption.ResponseHeadersRead,
+            TestContext.Current.CancellationToken);
+
+        // Wait until the request is actually inside the Collect delegate.
+        Assert.True(
+            collectEntered.Wait(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken),
+            "Request did not enter Collect in time.");
+
+        // Disposing cancels the listener's shutdown token, which the request is
+        // waiting on while its collection is still blocked. The request gives up on
+        // that collection as soon as the token is cancelled rather than waiting for
+        // it to finish, so disposal completes promptly without needing the
+        // collection itself to be released first.
+        var disposeTask = Task.Run(provider.Dispose, TestContext.Current.CancellationToken);
+
+        using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10)))
+        {
+            var completed = await Task.WhenAny(disposeTask, Task.Delay(Timeout.Infinite, cts.Token));
+            Assert.Same(disposeTask, completed);
+        }
+
+        await disposeTask;
+
+        using var response = await scrapeTask;
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+
+        // Release the still-running background collection so it does not leak past the test.
+        collectBlocker.Set();
+    }
+
+    [Fact]
+    public void StartIsIdempotentWhenAlreadyStarted()
+    {
+        using var context = CreateListener(startToken: TestContext.Current.CancellationToken);
+
+        var exception = Record.Exception(() => context.Listener.Start(TestContext.Current.CancellationToken));
+
+        Assert.Null(exception);
+    }
+
+    [Fact]
+    public async Task ScrapeEndpointPathWithoutLeadingSlashIsNormalized()
+    {
+        using var meter = new Meter(MeterName, MeterVersion);
+
+        using var context = CreateMeterProvider(meter, configureListener: (options) =>
+        {
+            options.Port = GetRandomPort();
+            options.ScrapeEndpointPath = "custom-metrics";
+            return options.Port;
+        });
+
+        meter.CreateCounter<int>("test_counter").Add(1);
+
+        using var client = new HttpClient { BaseAddress = context.BaseAddress };
+        using var response = await client.GetAsync(new Uri("custom-metrics", UriKind.Relative), TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Fact]
+    public void Host_DefaultValue_Is_Localhost()
+        => Assert.Equal("localhost", new PrometheusHttpListenerOptions().Host);
+
+    [Fact]
+    public void Port_DefaultValue_Is_9464()
+        => Assert.Equal(9464, new PrometheusHttpListenerOptions().Port);
+
+    [Fact]
+    public void DisposeImmediatelyAfterStartDoesNotThrow()
+    {
+        using var context = CreateListener(startToken: TestContext.Current.CancellationToken);
+        context.Listener.Dispose();
+    }
+
+    [Fact]
+    public void DisposeAfterStartWithCanceledTokenDoesNotThrow()
+    {
+        using var cancellationTokenSource = new CancellationTokenSource();
+        cancellationTokenSource.Cancel();
+
+        using var context = CreateListener(startToken: cancellationTokenSource.Token);
+        context.Listener.Dispose();
+    }
+
+    [Fact]
+    public async Task HttpListenerHandlesConcurrentScrapes()
+    {
+        EnsureThreadPoolWorkerThreadsAvailable();
+
+        var timeout = TimeSpan.FromSeconds(5);
+
+        using var firstCollectStarted = new ManualResetEventSlim();
+        using var allowFirstCollectToComplete = new ManualResetEventSlim();
+        using var secondCollectStarted = new ManualResetEventSlim();
+        using var allowSecondCollectToComplete = new ManualResetEventSlim();
+
+        using var context = CreateListener(
+            configureExporter: (options) => options.ScrapeResponseCacheDurationMilliseconds = 0,
+            startToken: TestContext.Current.CancellationToken);
+
+        using var client = new HttpClient() { BaseAddress = context.BaseAddress };
+
+        var collectCount = 0;
+
+        context.Exporter.Collect = _ =>
+        {
+            var currentCollect = Interlocked.Increment(ref collectCount);
+
+            if (currentCollect == 1)
+            {
+                firstCollectStarted.Set();
+
+                if (!allowFirstCollectToComplete.Wait(timeout))
+                {
+                    throw new TimeoutException("Timed out waiting for the test to release the first scrape.");
+                }
+            }
+            else if (currentCollect == 2)
+            {
+                secondCollectStarted.Set();
+
+                if (!allowSecondCollectToComplete.Wait(timeout))
+                {
+                    throw new TimeoutException("Timed out waiting for the test to release the second scrape.");
+                }
+            }
+
+            return true;
+        };
+
+        var requestUri = new Uri("metrics", UriKind.Relative);
+
+        var firstRequestTask = client.GetAsync(requestUri, TestContext.Current.CancellationToken);
+
+        Assert.True(firstCollectStarted.Wait(timeout, TestContext.Current.CancellationToken));
+
+        var secondRequestTask = client.GetAsync(requestUri, TestContext.Current.CancellationToken);
+
+        await Task.Delay(100, TestContext.Current.CancellationToken);
+
+        allowFirstCollectToComplete.Set();
+
+        try
+        {
+            using var firstResponse = await firstRequestTask;
+
+            Assert.Equal(HttpStatusCode.OK, firstResponse.StatusCode);
+
+#if NET
+            await secondRequestTask.WaitAsync(timeout, TestContext.Current.CancellationToken);
+#else
+            using var cts = new CancellationTokenSource(timeout);
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token, TestContext.Current.CancellationToken);
+            var completedTask = await Task.WhenAny(secondRequestTask, Task.Delay(timeout, linkedCts.Token));
+            Assert.Same(secondRequestTask, completedTask);
+#endif
+
+            Assert.False(secondCollectStarted.IsSet);
+
+            using var secondResponse = await secondRequestTask;
+
+            Assert.Equal(HttpStatusCode.OK, secondResponse.StatusCode);
+            Assert.Equal(1, Volatile.Read(ref collectCount));
+        }
+        finally
+        {
+            allowFirstCollectToComplete.Set();
+            allowSecondCollectToComplete.Set();
+        }
+    }
+
+    [Theory]
+    [InlineData("0.9")]
+    [InlineData("1")]
+    public async Task WhenRequestDeadlineExceeded_Returns408(string value)
+    {
+        // The scrape timeout is enforced via CancellationTokenSource.CancelAfter, whose
+        // cancellation callback is dispatched on the thread pool, and the listener only
+        // checks the token once Collect has returned. Blocking Collect for a fixed time
+        // assumes that callback will have run by then, which is not so when the pool is
+        // saturated (as it is when sibling test assemblies run alongside this one in CI):
+        // the callback is delayed past the sleep, the token is still un-cancelled, and the
+        // response is a 200. So wait on a timer of this test's own instead, which ties the
+        // wait to the pool actually dispatching timer callbacks rather than to the clock.
+        // It has to be armed here, on entry to the collection, rather than up front: the
+        // listener arms its deadline only once the request reaches its handler, so a timer
+        // started before the request is sent comes due first whenever establishing the
+        // connection takes longer than the margin, and the collection then returns while
+        // the listener's own token is still live.
+        EnsureThreadPoolWorkerThreadsAvailable();
+
+        var scrapeTimeout = TimeSpan.FromSeconds(double.Parse(value, CultureInfo.InvariantCulture));
+
+        using var context = CreateListener(startToken: TestContext.Current.CancellationToken);
+
+        context.Exporter.Collect = _ =>
+        {
+            using var deadlinePassed = new CancellationTokenSource(scrapeTimeout + DeadlineMargin);
+            deadlinePassed.Token.WaitHandle.WaitOne(MaxCollectWait);
+            return true;
+        };
+
+        using var client = new HttpClient { BaseAddress = context.BaseAddress };
+        client.DefaultRequestHeaders.Add("X-Prometheus-Scrape-Timeout-Seconds", value);
+
+        using var response = await client.GetAsync(new Uri("metrics", UriKind.Relative), TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.RequestTimeout, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task WhenClientRequestsLongerTimeoutThanServer_Returns408AtServerDeadline()
+    {
+        EnsureThreadPoolWorkerThreadsAvailable();
+
+        var serverTimeout = TimeSpan.FromSeconds(1);
+        var clientTimeout = TimeSpan.FromSeconds(30);
+
+        using var context = CreateListener(
+            configureListener: options =>
+            {
+                options.ScrapeResponseTimeoutMilliseconds = (int)serverTimeout.TotalMilliseconds;
+            },
+            startToken: TestContext.Current.CancellationToken);
+
+        context.Exporter.Collect = _ =>
+        {
+            using var deadlinePassed = new CancellationTokenSource(serverTimeout + DeadlineMargin);
+            deadlinePassed.Token.WaitHandle.WaitOne(MaxCollectWait);
+            return true;
+        };
+
+        using var client = new HttpClient { BaseAddress = context.BaseAddress };
+        client.DefaultRequestHeaders.Add(
+            "X-Prometheus-Scrape-Timeout-Seconds",
+            clientTimeout.TotalSeconds.ToString(CultureInfo.InvariantCulture));
+
+        var stopwatch = Stopwatch.StartNew();
+
+        using var response = await client.GetAsync(
+            new Uri("metrics", UriKind.Relative),
+            TestContext.Current.CancellationToken);
+
+        stopwatch.Stop();
+
+        Assert.Equal(HttpStatusCode.RequestTimeout, response.StatusCode);
+
+        // The response must have come back around the server's own (shorter) deadline,
+        // not the longer one the client asked for.
+        Assert.True(
+            stopwatch.Elapsed < clientTimeout,
+            $"Expected the server's {serverTimeout} deadline to apply, but the response took {stopwatch.Elapsed}.");
+    }
+
+    [Theory]
+    [InlineData("-1")]
+    [InlineData("0")]
+    [InlineData("0.0009")]
+    [InlineData("2147483")]
+    [InlineData("2147483.1")]
+    [InlineData("1.05e+003")]
+    [InlineData("foo")]
+    [InlineData("+Inf")]
+    [InlineData("-Inf")]
+    [InlineData("NaN")]
+    public async Task WhenRequestDeadlineInvalid_Returns200(string scrapeTimeoutSeconds)
+    {
+        using var meter = new Meter(MeterName, MeterVersion);
+
+        using var context = CreateMeterProvider(meter);
+
+        using var client = new HttpClient { BaseAddress = context.BaseAddress };
+        client.DefaultRequestHeaders.Add("X-Prometheus-Scrape-Timeout-Seconds", scrapeTimeoutSeconds);
+
+        using var response = await client.GetAsync(
+            new Uri("metrics", UriKind.Relative),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task WhenResponseExceedsMaxScrapeResponseSize_Returns500()
+    {
+        using var meter = new Meter(MeterName, MeterVersion);
+
+        using var context = CreateMeterProvider(
+            meter,
+            configureListener: options =>
+            {
+                options.Port = GetRandomPort();
+                options.MaxScrapeResponseSizeBytes = PrometheusExporterOptions.InitialScrapeResponseSizeBytes;
+                return options.Port;
+            });
+
+        // Emit enough series that the serialized response far exceeds the configured maximum, so
+        // the response buffer cannot grow to hold it and the scrape fails rather than returning a
+        // misleading empty 200 response.
+        for (var x = 0; x < 2_000; x++)
+        {
+            meter.CreateCounter<double>("counter_double_" + x, unit: "By").Add(1);
+        }
+
+        using var client = new HttpClient { BaseAddress = context.BaseAddress };
+
+        using var response = await client.GetAsync(
+            new Uri("metrics", UriKind.Relative),
+            TestContext.Current.CancellationToken);
+
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task ScrapeClientThatStopsReadingTheResponseBodyDoesNotBlockOtherScrapesIndefinitely()
+    {
+        using var meter = new Meter(MeterName, MeterVersion);
+
+        const int ScrapeTimeoutMilliseconds = 10_000;
+
+        using var context = CreateMeterProvider(
+            meter,
+            configureListener: options =>
+            {
+                options.Port = GetRandomPort();
+                options.ScrapeResponseTimeoutMilliseconds = ScrapeTimeoutMilliseconds;
+                return options.Port;
+            });
+
+        // Emit a payload far larger than any socket / HTTP.sys send buffer (including autotuned
+        // ones) so the response write cannot complete until the client actually drains the body.
+        // Stay under the SDK's default 1000-metric-stream cap and use a large label value on each
+        // stream instead; this produces roughly 12 MB of exposition text.
+        var padding = new string('x', 24_576);
+        for (var x = 0; x < 500; x++)
+        {
+            var counter = meter.CreateCounter<long>("counter_long_" + x.ToString(CultureInfo.InvariantCulture));
+            counter.Add(1, new KeyValuePair<string, object?>("key", padding));
+        }
+
+        // The scraper asks for the metrics and then never reads them. Shrink the receive
+        // buffer to (as close to) the platform's minimum as possible so back-pressure on
+        // the server's write is deterministic rather than depending on whatever the
+        // platform happens to auto-tune the socket buffers to for this connection.
+        using var stalledClient = new System.Net.Sockets.TcpClient
+        {
+            ReceiveBufferSize = 1,
+        };
+
+#if NET
+        await stalledClient.ConnectAsync(context.BaseAddress.Host, context.Port, TestContext.Current.CancellationToken);
+#else
+        await stalledClient.ConnectAsync(context.BaseAddress.Host, context.Port);
+#endif
+
+        var request = System.Text.Encoding.ASCII.GetBytes(
+            $"GET /metrics HTTP/1.1\r\nHost: localhost:{context.Port}\r\nConnection: keep-alive\r\n\r\n");
+        var stalledStream = stalledClient.GetStream();
+
+#if NET
+        await stalledStream.WriteAsync(request, TestContext.Current.CancellationToken);
+#else
+        await stalledStream.WriteAsync(request, 0, request.Length, TestContext.Current.CancellationToken);
+#endif
+
+        await stalledStream.FlushAsync(TestContext.Current.CancellationToken);
+
+        // Read just enough to confirm the response actually started (headers plus whatever
+        // part of the body fits in the receive buffer), without draining the rest of the body.
+        var buffer = new byte[512];
+
+        using (var headerCts = new CancellationTokenSource(MaxCollectWait))
+        {
+#if NET
+            var bytesRead = await stalledStream.ReadAsync(buffer, headerCts.Token);
+#else
+            var bytesRead = await stalledStream.ReadAsync(buffer, 0, buffer.Length, headerCts.Token);
+#endif
+            Assert.True(bytesRead > 0, "Expected to receive the start of the response.");
+        }
+
+        // Prove the write is genuinely stalled
+        await Task.Delay(TimeSpan.FromSeconds(1), TestContext.Current.CancellationToken);
+
+        var available = stalledClient.Available;
+
+        Assert.True(
+            available < padding.Length * 10,
+            $"Expected the unread, buffered response to stay far below the ~12 MB body, but {available} bytes are already buffered.");
+
+        // Wait past the server-side timeout so the stalled request has cancelled its write and
+        // released the reader slot while the stalled client is still connected and still not
+        // reading: recovery must come from the server timeout, not from the client disconnecting.
+        await Task.Delay(TimeSpan.FromMilliseconds((ScrapeTimeoutMilliseconds * 2) + 1000), TestContext.Current.CancellationToken);
+
+        Assert.True(stalledClient.Connected);
+
+        using var client = new HttpClient { BaseAddress = context.BaseAddress };
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+        using var response = await client.GetAsync(new Uri("metrics", UriKind.Relative), cts.Token);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    internal static MeterProviderTestContext CreateMeterProvider(
+        Meter meter,
+        Func<PrometheusHttpListenerOptions, int>? configureListener = null,
+        Action<MeterProviderBuilder>? configureMeterProvider = null,
+        IEnumerable<KeyValuePair<string, object>>? attributes = null)
+    {
+        var maximumAttempts = 5;
+        var attemptsLeft = maximumAttempts;
+
+        configureListener ??= static (options) =>
+        {
+            options.Port = GetRandomPort();
+            return options.Port;
+        };
+
+        while (attemptsLeft-- > 0)
+        {
+            var port = -1;
+
+            var builder = Sdk.CreateMeterProviderBuilder()
+                .AddMeter(meter.Name)
+                .ConfigureResource((p) =>
+                {
+                    p.Clear().AddService("my_service", serviceInstanceId: "id1");
+
+                    if (attributes is not null)
+                    {
+                        p.AddAttributes(attributes);
+                    }
+                })
+                .AddPrometheusHttpListener((options) =>
+                {
+                    port = configureListener(options);
+                });
+
+            configureMeterProvider?.Invoke(builder);
+
+            var provider = builder.Build();
+
+            return new(provider, port);
+        }
+
+        throw new InvalidOperationException($"{nameof(MeterProvider)} could not be created within {maximumAttempts} attempts.");
+    }
+
+    private static void EnsureThreadPoolWorkerThreadsAvailable()
+    {
+        ThreadPool.GetMinThreads(out var workerThreads, out var completionPortThreads);
+
+        var desiredWorkerThreads = Math.Max(workerThreads, Environment.ProcessorCount * 2);
+
+        if (desiredWorkerThreads > workerThreads)
+        {
+            ThreadPool.SetMinThreads(desiredWorkerThreads, completionPortThreads);
+        }
+    }
+
+    private static async Task<string> RunPrometheusExporterHttpServerIntegrationTest(
+        bool skipMetrics = false,
+        string acceptHeader = "application/openmetrics-text",
+        string? contentType = null,
+        KeyValuePair<string, object?>[]? meterTags = null,
+        bool assertResponseContent = true,
+        Func<PrometheusHttpListenerOptions, int>? configureListener = null)
+    {
+        var requestOpenMetrics = acceptHeader.StartsWith("application/openmetrics-text", StringComparison.Ordinal);
+
+        using var meter = new Meter(MeterName, MeterVersion, meterTags);
+
+        using var context = CreateMeterProvider(meter, configureListener);
+
+        var counterTags = new KeyValuePair<string, object?>[]
+        {
+            new("key1", "value1"),
+            new("key2", "value2"),
+        };
+
+        var counter = meter.CreateCounter<double>("counter_double", unit: "By");
+        if (!skipMetrics)
+        {
+            counter.Add(100.18D, counterTags);
+            counter.Add(0.99D, counterTags);
+        }
+
+        using var client = new HttpClient
+        {
+            BaseAddress = context.BaseAddress,
+        };
+
+        if (!string.IsNullOrEmpty(acceptHeader))
+        {
+            client.DefaultRequestHeaders.Add("Accept", acceptHeader);
+        }
+
+        using var response = await client.GetAsync(new Uri("metrics", UriKind.Relative));
+        var content = await response.Content.ReadAsStringAsync();
+
+        if (!skipMetrics && assertResponseContent)
+        {
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.True(response.Content.Headers.Contains("Last-Modified"));
+
+            contentType ??=
+                requestOpenMetrics ?
+                "application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=underscores" :
+                "text/plain; version=0.0.4; charset=utf-8";
+
+            Assert.NotNull(response.Content);
+            Assert.NotNull(response.Content.Headers.ContentType);
+            Assert.Equal(contentType, response.Content.Headers.ContentType.ToString());
+
+            var additionalTags = meterTags is { Length: > 0 }
+                ? $"{string.Join(",", meterTags.Select(x => $"otel_scope_{x.Key}='{x.Value}'"))},"
+                : string.Empty;
+            var createdMetricSample = requestOpenMetrics
+                ? $"counter_double_bytes_created{{otel_scope_name='{MeterName}',otel_scope_version='{MeterVersion}',{additionalTags}key1='value1',key2='value2'}} [0-9]+(?:\\.[0-9]+)?\n"
+                : string.Empty;
+
+            var expected = requestOpenMetrics
+                ? "# TYPE target info\n"
+                  + "# HELP target Target metadata\n"
+                  + "target_info{service_name='my_service',service_instance_id='id1'} 1\n"
+                  + "# TYPE counter_double_bytes counter\n"
+                  + "# UNIT counter_double_bytes bytes\n"
+                  + $"counter_double_bytes_total{{otel_scope_name='{MeterName}',otel_scope_version='{MeterVersion}',{additionalTags}key1='value1',key2='value2'}} 101.17\n"
+                  + createdMetricSample
+                  + "# EOF\n"
+                : "# TYPE target_info gauge\n"
+                  + "# HELP target_info Target metadata\n"
+                  + "target_info{service_name='my_service',service_instance_id='id1'} 1\n"
+                  + "# TYPE counter_double_bytes_total counter\n"
+                  + $"counter_double_bytes_total{{otel_scope_name='{MeterName}',otel_scope_version='{MeterVersion}',{additionalTags}key1='value1',key2='value2'}} 101.17\n";
+
+            Assert.Matches(("^" + expected + "$").Replace('\'', '"'), content);
+        }
+        else
+        {
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
+
+        return content;
+    }
+
+    private static int GetRandomPort()
+    {
+        int port;
+
+        // Try to only use each port number exactly once
+        while (!ConsumedPorts.TryAdd(port = TcpPortProvider.GetOpenPort(), port))
+        {
+        }
+
+        return port;
+    }
+
+    private static PrometheusTestContext CreateListener(
+        Action<PrometheusExporterOptions>? configureExporter = null,
+        Action<PrometheusHttpListenerOptions>? configureListener = null,
+        CancellationToken startToken = default)
+    {
+        var maximumAttempts = 5;
+        var attemptsLeft = maximumAttempts;
+        var boundPort = 0;
+
+        var exporterOptions = new PrometheusExporterOptions();
+
+        configureExporter?.Invoke(exporterOptions);
+
+        var listenerOptions = new PrometheusHttpListenerOptions()
+        {
+            Host = "localhost",
+        };
+
+        configureListener?.Invoke(listenerOptions);
+
+#pragma warning disable CA2000 // Dispose objects before losing scope
+        var exporter = new PrometheusExporter(exporterOptions);
+#pragma warning restore CA2000 // Dispose objects before losing scope
+
+        try
+        {
+            while (attemptsLeft-- > 0)
+            {
+                var port = GetRandomPort();
+
+                listenerOptions.Port = port;
+
+#pragma warning disable CA2000 // Dispose objects before losing scope
+                var listener = new PrometheusHttpListener(exporter, listenerOptions);
+#pragma warning restore CA2000 // Dispose objects before losing scope
+
+                try
+                {
+                    listener.Start(startToken);
+                    boundPort = port;
+
+                    return new(exporter, listener, boundPort);
+                }
+                catch (Exception)
+                {
+                    // Try again, possibly with a different port
+                    listener.Dispose();
+                }
+            }
+
+            throw new InvalidOperationException($"{nameof(PrometheusHttpListener)} could not be started within {maximumAttempts} attempts.");
+        }
+        catch (Exception)
+        {
+            exporter.Dispose();
+            throw;
+        }
+    }
+
+    internal sealed class MeterProviderTestContext(MeterProvider provider, int port) : IDisposable
+    {
+        public MeterProvider Provider { get; } = provider;
+
+        public Uri BaseAddress { get; } = new UriBuilder(Uri.UriSchemeHttp, "localhost", port).Uri;
+
+        public int Port { get; } = port;
+
+        public void Dispose()
+            => this.Provider.Dispose();
+    }
+
+    private sealed class PrometheusTestContext(PrometheusExporter exporter, PrometheusHttpListener listener, int port) : IDisposable
+    {
+        public Uri BaseAddress { get; } = new UriBuilder(Uri.UriSchemeHttp, "localhost", port).Uri;
+
+        public PrometheusExporter Exporter { get; } = exporter;
+
+        public PrometheusHttpListener Listener { get; } = listener;
+
+        public int Port { get; } = port;
+
+        public void Dispose()
+        {
+            this.Exporter.Dispose();
+            this.Listener.Dispose();
+        }
+    }
+}
